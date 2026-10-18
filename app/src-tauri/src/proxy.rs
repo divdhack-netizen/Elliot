@@ -18,6 +18,7 @@ pub struct ProxyState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartArgs {
     /// e.g. "127.0.0.1:8080". Must be loopback (enforced by the engine).
     pub listen_addr: String,
@@ -38,6 +39,7 @@ struct FlowEvent {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Decision {
     pub flow_id: uuid::Uuid,
     /// "forward" | "forward_edited" | "drop".
@@ -140,5 +142,29 @@ pub async fn proxy_get_ca_pem(state: State<'_, ProxyState>) -> Result<String, St
     match &*state.handle.lock().await {
         Some(handle) => Ok(handle.ca_pem()),
         None => Err("proxy not running".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The frontend sends camelCase keys; these must deserialize into the
+    // snake_case Rust fields (regression guard for the rename_all).
+    #[test]
+    fn start_args_accepts_camel_case() {
+        let a: StartArgs = serde_json::from_str(r#"{"listenAddr":"127.0.0.1:8080"}"#).unwrap();
+        assert_eq!(a.listen_addr, "127.0.0.1:8080");
+        assert!(a.verify_upstream, "verify_upstream defaults to true");
+    }
+
+    #[test]
+    fn decision_accepts_camel_case() {
+        let d: Decision = serde_json::from_str(
+            r#"{"flowId":"00000000-0000-0000-0000-000000000000","action":"forward"}"#,
+        )
+        .unwrap();
+        assert_eq!(d.action, "forward");
+        assert!(d.flow_id.is_nil());
     }
 }
