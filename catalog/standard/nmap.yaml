@@ -1,0 +1,60 @@
+# Reference ("golden") catalog entry — nmap.
+# This is the template every other STANDARD entry follows. It is hand-vetted:
+# the security annotations (per-flag intrusiveness, the vetted --script enum,
+# confined paths, declared privileges) are human judgment, never auto-generated.
+# Validates against ../schema/tool-entry.schema.yaml.
+id: nmap
+binary: nmap
+source: standard
+description: Network scanner — host discovery, port scanning, service/version detection.
+base_intrusiveness: low
+
+target:
+  kind: positional
+  type: host_or_cidr
+  cardinality: one_or_more
+  scope_checked: true
+
+limits:
+  max_targets: 256
+  timeout_seconds: 1800
+
+flags:
+  - name: "-T"
+    type: enum
+    values: ["0", "1", "2", "3", "4", "5"]
+    description: Timing template, from paranoid (0) to aggressive (5).
+
+  - name: "-p"
+    type: string
+    pattern: "^[0-9,-]+$"
+    description: Ports or ranges — digits, commas, hyphens only (e.g. 80,443,8000-8100).
+
+  - name: "-sV"
+    type: bool
+    intrusiveness: low
+    description: Probe open ports to determine service/version info.
+
+  - name: "-sS"
+    type: bool
+    intrusiveness: intrusive
+    requires_privilege: raw_socket
+    description: SYN scan. The runner verifies the raw-socket privilege and reports if absent.
+
+  - name: "--script"
+    type: enum
+    values: ["default", "safe", "version"]
+    intrusiveness: intrusive
+    description: Only vetted, low-risk script categories — never arbitrary scripts.
+
+  - name: "-iL"
+    type: path
+    confined_to: project_dir
+    access: read
+    description: Read the target list from a file inside the project directory.
+
+  - name: "-oX"
+    type: path
+    confined_to: project_dir
+    access: write
+    description: Write XML output to a file inside the project directory.

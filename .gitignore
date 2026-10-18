@@ -1,1 +1,13 @@
 .DS_Store
+
+# Build artifacts
+target/
+node_modules/
+app/dist/
+
+# Python sidecar
+agent/.venv/
+__pycache__/
+
+# Project files (SQLite)
+*.db

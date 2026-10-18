@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+  "core/proxy", "core/scope", "core/store", "core/httpraw",
+  "core/repeater", "core/intruder", "core/runner", "core/catalog",
+  "app/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "macros"] }
+anyhow = "1"
+thiserror = "2"
+
+# Lint condivisi, ereditati da ogni crate con `[lints] workspace = true`.
+# Coerenti con la "security by design" del progetto: nel core l'unsafe è
+# vietato (deroga esplicita per-crate se mai servisse via FFI), e clippy è
+# attivo fin dall'inizio così il debito non si accumula.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Profilo di rilascio: binario più piccolo e veloce. Non tocca i build di
+# sviluppo. `panic = "unwind"` (default) mantenuto di proposito: un panic nel
+# proxy/runner non deve abortire l'intero processo.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

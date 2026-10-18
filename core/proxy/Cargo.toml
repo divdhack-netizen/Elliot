@@ -1,0 +1,31 @@
+[package]
+name = "elliot-proxy"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+elliot-httpraw = { path = "../httpraw" }
+
+# MITM proxy engine (hyper + rustls + rcgen under the hood). Default features
+# already bring rustls-client + rcgen-ca + the decoder; http2 is opt-in.
+hudsucker = { version = "0.25", features = ["http2"] }
+# Same rcgen version hudsucker re-exports, so the `Issuer` type unifies. The
+# `x509-parser` feature is required by `Issuer::from_ca_cert_pem`.
+rcgen = { version = "0.14.7", features = ["x509-parser"] }
+
+tokio = { workspace = true, features = ["sync", "net"] }
+http = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+http-body-util = "0.1"
+httparse = "1"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+tempfile = "3"
+
+[lints]
+workspace = true
