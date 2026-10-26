@@ -1,12 +1,10 @@
 //! Tauri wiring for the proxy engine: commands the frontend calls, plus the
 //! pump that forwards [`ProxyEvent`]s to the UI as `proxy://flow` events.
 
-use std::sync::Arc;
-
 use elliot_httpraw::{Flow, WsMessage};
-use elliot_proxy::{
-    start, AllowAll, InterceptDecision, ProxyConfig, ProxyEvent, ProxyHandle,
-};
+use elliot_proxy::{start, InterceptDecision, ProxyConfig, ProxyEvent, ProxyHandle};
+
+use crate::scope::ScopeState;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
@@ -56,6 +54,7 @@ pub struct Decision {
 pub async fn proxy_start(
     app: AppHandle,
     state: State<'_, ProxyState>,
+    scope: State<'_, ScopeState>,
     args: StartArgs,
 ) -> Result<(), String> {
     let mut guard = state.handle.lock().await;
@@ -77,7 +76,9 @@ pub async fn proxy_start(
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ProxyEvent>(1024);
-    let handle = start(config, Arc::new(AllowAll), tx)
+    // The decider follows the live policy, so scope edits made while the proxy
+    // runs apply to the next request.
+    let handle = start(config, scope.decider(), tx)
         .await
         .map_err(|e| e.to_string())?;
     *guard = Some(handle);

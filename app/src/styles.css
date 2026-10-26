@@ -347,6 +347,38 @@ code, .mono { font-family: var(--mono); }
 .steps code { background: var(--bg-3); padding: 0 4px; border-radius: 3px; }
 .pem { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; max-height: 220px; overflow: auto; font-size: 11px; }
 
+/* ---------- Scope ---------- */
+.scope { flex: 1; min-height: 0; overflow: auto; padding: 12px; display: grid; gap: 12px; align-content: start; }
+.scope .banner.error { border: 1px solid rgba(248, 81, 73, 0.35); border-radius: 6px; }
+.scope-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.scope-card > header {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  background: var(--bg-2); border-bottom: 1px solid var(--border); font-weight: 600;
+}
+.scope-card .body { padding: 10px; display: grid; gap: 8px; }
+.scope-card .body p { margin: 0; }
+.scope-card input, .scope-card select {
+  height: 26px; min-width: 0; padding: 0 8px;
+  background: var(--bg); border: 1px solid var(--border-strong); border-radius: 4px; outline: none;
+}
+.scope-card input:focus, .scope-card select:focus { border-color: var(--accent); }
+.scope-card input:disabled { color: var(--fg-faint); }
+.row { display: flex; align-items: center; gap: 8px; }
+.row > input { flex: 0 1 300px; }
+.tag {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 1px 6px; border-radius: 3px; background: var(--bg-3); color: var(--fg-dim);
+}
+.tag.ok { background: rgba(63, 185, 80, 0.18); color: var(--ok); }
+.tag.warn { background: rgba(227, 179, 65, 0.18); color: var(--warn); }
+.rule-row {
+  display: grid; grid-template-columns: 84px 152px minmax(140px, 1.3fr) 76px minmax(110px, 1fr) 26px;
+  gap: 6px; align-items: center;
+}
+.rule-head { font-family: var(--sans); font-size: 11px; color: var(--fg-faint); }
+.tiny { width: 6px; height: 6px; }
+.dot.ok { background: var(--ok); }
+
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border: 2px solid var(--bg); border-radius: 6px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }

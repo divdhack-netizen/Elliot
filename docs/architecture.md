@@ -268,10 +268,26 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
     il gate resta al chiamante (l'intruder lo fa prima di inviare), documentato
     nel crate. Se in futuro il repeater accettasse target dall'esterno, andrebbe
     aggiunto un `Option<&dyn ScopeDecider>` a `send`.
-- **Prossimo:** cablare questi crate nell'app — `ScopePolicy` al posto di
-  `AllowAll` (comandi Tauri scope + UI), persistenza dei flow nello `store`,
-  `runner` dietro l'approvazione umana dell'agente, UI di repeater e intruder —
-  più la UI per i messaggi WebSocket.
+- **Fatto (2026-10-26):** **scope collegato al guscio Tauri.** In `elliot-scope`
+  `SharedPolicy` tiene la policy dietro lock e la rilegge a **ogni** decisione:
+  il proxy la riceve una volta e una modifica fatta nella UI vale dalla
+  richiesta successiva, senza riavvio. La policy vive nel **file di progetto**:
+  lo store espone una tabella `settings` (chiave + valore byte opachi) e l'app
+  la serializza lì sotto la chiave `scope_policy`. Comandi Tauri:
+  `project_create`/`project_open`/`project_close`/`project_status` (passphrase,
+  SQLCipher) e `scope_get`/`scope_set`. Senza progetto aperto le modifiche
+  restano di sessione, e la UI lo dichiara. `Store::create` ora **rifiuta
+davvero** un file esistente: prima lo documentava soltanto e SQLite lo avrebbe
+  aperto in place, mescolando due progetti. UI: sub-tab **Scope** nella
+  schermata Proxy, con file di progetto e liste include/exclude (scheme, host
+  esatto o dominio+sottodomini, porta, prefisso di path); con lista include
+  vuota il badge avvisa, perché la policy vuota **non cattura nulla**. Verificato
+  da un test end-to-end sul proxy reale: policy vuota ⇒ la richiesta passa ma non
+  viene catturata; definirla ⇒ catturata; azzerarla ⇒ smette — sempre sullo
+  stesso processo.
+- **Prossimo:** persistenza dei flow nello `store` dal proxy, `runner` dietro
+  l'approvazione umana dell'agente, UI di repeater e intruder, più la UI per i
+  messaggi WebSocket.
 
 ## Non ancora deciso
 

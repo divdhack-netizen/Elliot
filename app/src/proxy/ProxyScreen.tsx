@@ -9,8 +9,10 @@ import { InterceptView } from "./InterceptView";
 import { MessageViewer, type Message, type ViewerTab } from "./MessageViewer";
 import { HIGHLIGHTS, type Row } from "./types";
 import { useProxy } from "./useProxy";
+import { ScopePanel } from "../scope/ScopePanel";
+import { useScope } from "../scope/useScope";
 
-type SubTab = "intercept" | "history";
+type SubTab = "intercept" | "history" | "scope";
 
 const FILTER_EXAMPLES = [
   "host contains api",
@@ -22,6 +24,7 @@ const FILTER_EXAMPLES = [
 
 export function ProxyScreen() {
   const api = useProxy();
+  const scope = useScope();
   const [sub, setSub] = useState<SubTab>("history");
   const [filter, setFilter] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -116,6 +119,19 @@ export function ProxyScreen() {
             HTTP history
             {api.rows.length > 0 && <span className="count">{api.rows.length}</span>}
           </button>
+          <button className={sub === "scope" ? "active" : ""} onClick={() => setSub("scope")}>
+            Scope
+            {/* An empty scope means nothing is captured — easy to misread as a
+                broken proxy, so it is flagged rather than shown as "0". */}
+            {scope.policy.include.length > 0 ? (
+              <span className="count">{scope.policy.include.length}</span>
+            ) : (
+              <span className="count warn" title="Nothing is in scope: nothing is captured">
+                !
+              </span>
+            )}
+            {scope.project?.open && <span className="dot ok tiny" title="Scope is saved to the project file" />}
+          </button>
         </nav>
         <span className="spacer" />
         <label className="addr">
@@ -165,7 +181,9 @@ export function ProxyScreen() {
       )}
 
       <div className="proxy-body">
-        {sub === "intercept" ? (
+        {sub === "scope" ? (
+          <ScopePanel api={scope} />
+        ) : sub === "intercept" ? (
           <InterceptView api={api} />
         ) : (
           <>
