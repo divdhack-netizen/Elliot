@@ -999,13 +999,11 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "elliot-httpraw",
+ "elliot-tls",
  "httparse",
- "rustls",
  "rustls-pki-types",
  "thiserror 2.0.21",
  "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1040,6 +1038,19 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "elliot-tls"
+version = "0.0.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

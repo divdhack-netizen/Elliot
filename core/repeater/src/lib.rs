@@ -19,8 +19,6 @@ use tokio::net::TcpStream;
 
 use elliot_httpraw::{Header, HttpVersion, Response};
 
-mod tls;
-
 /// Default cap on how long to wait for the response once the request is sent.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -86,6 +84,8 @@ pub struct RepeatResponse {
 pub enum RepeatError {
     #[error("invalid server name {0:?}")]
     InvalidServerName(String),
+    #[error("tls config: {0}")]
+    TlsConfig(#[from] elliot_tls::TlsError),
     #[error("connect: {0}")]
     Connect(#[source] std::io::Error),
     #[error("tls: {0}")]
@@ -110,7 +110,7 @@ pub async fn send(req: RepeatRequest) -> Result<RepeatResponse, RepeatError> {
     let raw = if req.tls {
         let server_name = ServerName::try_from(req.host.clone())
             .map_err(|_| RepeatError::InvalidServerName(req.host.clone()))?;
-        let connector = tls::connector(req.accept_invalid_certs);
+        let connector = elliot_tls::connector(req.accept_invalid_certs)?;
         let mut stream = connector
             .connect(server_name, tcp)
             .await

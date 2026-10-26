@@ -5,13 +5,12 @@ version.workspace = true
 
 [dependencies]
 elliot-httpraw = { path = "../httpraw" }
+# The TLS policy (configs + the opt-in permissive verifier) lives in elliot-tls.
+elliot-tls = { path = "../tls" }
 
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
-# rustls (aws-lc-rs provider, matching the proxy) for the TLS variant; no OpenSSL.
-tokio-rustls = "0.26"
-rustls = "0.23"
+# Only for the `ServerName` used to dial; the rustls config comes from elliot-tls.
 rustls-pki-types = "1"
-webpki-roots = "0.26"
 
 httparse = "1"
 bytes = "1"

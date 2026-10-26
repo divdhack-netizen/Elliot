@@ -1,0 +1,21 @@
+[package]
+name = "elliot-tls"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+# rustls with the aws-lc-rs provider, matching the rest of the core. No OpenSSL:
+# this crate is where the project's TLS policy is decided once.
+rustls = "0.23"
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# A self-signed TLS server, to prove the permissive verifier is opt-in only.
+rcgen = "0.14"
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
