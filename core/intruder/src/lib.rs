@@ -7,6 +7,8 @@
 //!
 //! Like the repeater, the base request and every mutated request are sent
 //! **byte-exact** — the point is to probe with crafted and malformed input.
+//! Payloads are therefore raw bytes ([`Payload`]); a fuzzer must be able to send
+//! values that are not valid UTF-8.
 //!
 //! Scope is checked **once, before anything is sent**: the attack's target host
 //! must be [`ScopeDecision::InScope`], or [`run`] refuses and sends nothing.
@@ -16,15 +18,27 @@
 //! - **Battering ram**: one payload set; the same payload in every position.
 //! - **Pitchfork**: one payload set per position; iterated in lockstep.
 //! - **Cluster bomb**: one payload set per position; full cartesian product.
+//!
+//! # Concurrency and limits
+//!
+//! Requests in flight are capped by [`Attack::concurrency`], and jobs are pulled
+//! only as a slot frees up (a bounded stream, not one task spawned per job).
+//!
+//! The *plan* is still materialised: [`plan`] expands the whole job list in
+//! memory, so a cluster bomb over several large sets grows as their cartesian
+//! product. Streaming the expansion lazily is a known follow-up.
 
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 
 use elliot_httpraw::{ScopeDecider, ScopeDecision};
 use elliot_repeater::{RepeatRequest, DEFAULT_READ_TIMEOUT};
+
+/// One injection payload: raw bytes, so malformed and non-UTF-8 probes work.
+pub type Payload = Vec<u8>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttackMode {
@@ -47,7 +61,7 @@ pub struct Attack {
     pub positions: Vec<Range<usize>>,
     /// Payload sets. One set for Sniper/BatteringRam; one set **per position**
     /// for Pitchfork/ClusterBomb.
-    pub payloads: Vec<Vec<String>>,
+    pub payloads: Vec<Vec<Payload>>,
     pub mode: AttackMode,
     /// Maximum requests in flight at once (clamped to at least 1).
     pub concurrency: usize,
@@ -71,6 +85,23 @@ impl Attack {
             accept_invalid_certs: false,
         }
     }
+
+    /// Payload sets for Sniper/Battering ram: a single set, from strings.
+    ///
+    /// The common case is textual, and building `Vec<Vec<u8>>` by hand is noisy;
+    /// payloads are still stored as bytes.
+    pub fn payloads_from_str(set: &[&str]) -> Vec<Vec<Payload>> {
+        vec![bytes_of(set)]
+    }
+
+    /// Payload sets for Pitchfork/Cluster bomb: one set **per position**.
+    pub fn payload_sets_from_str(sets: &[&[&str]]) -> Vec<Vec<Payload>> {
+        sets.iter().map(|set| bytes_of(set)).collect()
+    }
+}
+
+fn bytes_of(set: &[&str]) -> Vec<Payload> {
+    set.iter().map(|s| s.as_bytes().to_vec()).collect()
 }
 
 /// One request's outcome.
@@ -79,7 +110,7 @@ pub struct AttackResult {
     /// Position of this request in the generated sequence.
     pub index: usize,
     /// (position index, payload) pairs applied to the base.
-    pub assignments: Vec<(usize, String)>,
+    pub assignments: Vec<(usize, Payload)>,
     pub status: Option<u16>,
     pub response_len: usize,
     pub elapsed: Duration,
@@ -120,7 +151,9 @@ pub enum IntruderError {
 
 /// Validate the attack and expand it into the concrete jobs that would run,
 /// without sending anything. Useful for a dry-run / preview.
-pub fn plan(attack: &Attack) -> Result<Vec<Vec<(usize, String)>>, IntruderError> {
+///
+/// Materialises the whole expansion; see the crate docs for the limit.
+pub fn plan(attack: &Attack) -> Result<Vec<Vec<(usize, Payload)>>, IntruderError> {
     validate_positions(&attack.base, &attack.positions)?;
     validate_payloads(attack)?;
     Ok(expand_jobs(attack))
@@ -144,50 +177,46 @@ pub async fn run(
         });
     }
 
-    let permits = Arc::new(tokio::sync::Semaphore::new(attack.concurrency.max(1)));
-    let mut handles = Vec::with_capacity(jobs.len());
-
-    for (index, assignments) in jobs.into_iter().enumerate() {
-        let body = apply_with(&attack.base, &attack.positions, &assignments);
+    // Build each request lazily from the job list, then replay with bounded
+    // concurrency. `buffer_unordered` pulls a job only when a slot frees, so the
+    // attack never spawns one task per job up front.
+    let requests = jobs.into_iter().enumerate().map(|(index, assignments)| {
+        let raw = apply_with(&attack.base, &attack.positions, &assignments);
         let req = RepeatRequest {
             host: attack.host.clone(),
             port: attack.port,
             tls: attack.tls,
-            raw: body,
+            raw,
             read_timeout: attack.read_timeout,
             accept_invalid_certs: attack.accept_invalid_certs,
         };
-        let permits = permits.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permits.acquire_owned().await.expect("semaphore open");
-            let outcome = elliot_repeater::send(req).await;
-            (index, assignments, outcome)
-        }));
-    }
+        (index, assignments, req)
+    });
 
-    let mut results = Vec::with_capacity(handles.len());
-    for h in handles {
-        let (index, assignments, outcome) = h.await.expect("intruder task panicked");
-        let result = match outcome {
-            Ok(resp) => AttackResult {
-                index,
-                assignments,
-                status: resp.response.as_ref().map(|r| r.status),
-                response_len: resp.raw.len(),
-                elapsed: resp.elapsed,
-                error: None,
-            },
-            Err(e) => AttackResult {
-                index,
-                assignments,
-                status: None,
-                response_len: 0,
-                elapsed: Duration::ZERO,
-                error: Some(e.to_string()),
-            },
-        };
-        results.push(result);
-    }
+    let mut results: Vec<AttackResult> = stream::iter(requests)
+        .map(|(index, assignments, req)| async move {
+            match elliot_repeater::send(req).await {
+                Ok(resp) => AttackResult {
+                    index,
+                    assignments,
+                    status: resp.response.as_ref().map(|r| r.status),
+                    response_len: resp.raw.len(),
+                    elapsed: resp.elapsed,
+                    error: None,
+                },
+                Err(e) => AttackResult {
+                    index,
+                    assignments,
+                    status: None,
+                    response_len: 0,
+                    elapsed: Duration::ZERO,
+                    error: Some(e.to_string()),
+                },
+            }
+        })
+        .buffer_unordered(attack.concurrency.max(1))
+        .collect()
+        .await;
     results.sort_by_key(|r| r.index);
 
     let summary = AttackSummary {
@@ -243,7 +272,7 @@ fn validate_payloads(attack: &Attack) -> Result<(), IntruderError> {
     Ok(())
 }
 
-fn expand_jobs(attack: &Attack) -> Vec<Vec<(usize, String)>> {
+fn expand_jobs(attack: &Attack) -> Vec<Vec<(usize, Payload)>> {
     let n = attack.positions.len();
     match attack.mode {
         AttackMode::Sniper => {
@@ -269,7 +298,7 @@ fn expand_jobs(attack: &Attack) -> Vec<Vec<(usize, String)>> {
                 .collect()
         }
         AttackMode::ClusterBomb => {
-            let mut jobs: Vec<Vec<(usize, String)>> = vec![Vec::new()];
+            let mut jobs: Vec<Vec<(usize, Payload)>> = vec![Vec::new()];
             for (pos, set) in attack.payloads.iter().enumerate() {
                 let mut next = Vec::with_capacity(jobs.len() * set.len());
                 for prefix in &jobs {
@@ -289,13 +318,13 @@ fn expand_jobs(attack: &Attack) -> Vec<Vec<(usize, String)>> {
 /// Apply replacements to the base. Assignments carry a position *index*; the
 /// actual byte range comes from `positions`. Substituting from the rightmost
 /// position first keeps earlier byte offsets valid as lengths change.
-fn apply_with(base: &[u8], positions: &[Range<usize>], assignments: &[(usize, String)]) -> Bytes {
+fn apply_with(base: &[u8], positions: &[Range<usize>], assignments: &[(usize, Payload)]) -> Bytes {
     let mut out = base.to_vec();
-    let mut ordered: Vec<&(usize, String)> = assignments.iter().collect();
+    let mut ordered: Vec<&(usize, Payload)> = assignments.iter().collect();
     ordered.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
     for (pos, value) in ordered {
         let range = positions[*pos].clone();
-        out.splice(range, value.bytes());
+        out.splice(range, value.iter().copied());
     }
     Bytes::from(out)
 }
@@ -304,6 +333,7 @@ fn apply_with(base: &[u8], positions: &[Range<usize>], assignments: &[(usize, St
 mod tests {
     use super::*;
     use elliot_scope::ScopePolicy;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -313,7 +343,7 @@ mod tests {
         // positions over AAA (5..8) and BBB (11..14)
         let attack = Attack {
             positions: vec![5..8, 11..14],
-            payloads: vec![vec!["1".into(), "2".into()]],
+            payloads: Attack::payloads_from_str(&["1", "2"]),
             mode: AttackMode::Sniper,
             ..Attack::new("h", 80, base)
         };
@@ -328,7 +358,7 @@ mod tests {
         let base = Bytes::from_static(b"AA BB");
         let attack = Attack {
             positions: vec![0..2, 3..5],
-            payloads: vec![vec!["1".into(), "2".into()], vec!["x".into(), "y".into(), "z".into()]],
+            payloads: Attack::payload_sets_from_str(&[&["1", "2"], &["x", "y", "z"]]),
             mode: AttackMode::ClusterBomb,
             ..Attack::new("h", 80, base)
         };
@@ -340,7 +370,7 @@ mod tests {
     fn overlapping_positions_are_rejected() {
         let attack = Attack {
             positions: vec![0..3, 2..5],
-            payloads: vec![vec!["a".into()]],
+            payloads: Attack::payloads_from_str(&["a"]),
             mode: AttackMode::Sniper,
             ..Attack::new("h", 80, Bytes::from_static(b"abcdef"))
         };
@@ -351,7 +381,7 @@ mod tests {
     fn pitchfork_requires_one_set_per_position() {
         let attack = Attack {
             positions: vec![0..1, 2..3],
-            payloads: vec![vec!["a".into()]], // only one set
+            payloads: Attack::payloads_from_str(&["a"]), // only one set
             mode: AttackMode::Pitchfork,
             ..Attack::new("h", 80, Bytes::from_static(b"a b"))
         };
@@ -395,7 +425,7 @@ mod tests {
         let payload_point = 5..12; // "PAYLOAD"
         let attack = Attack {
             positions: vec![payload_point],
-            payloads: vec![vec!["a".into(), "bb".into(), "ccc".into()]],
+            payloads: Attack::payloads_from_str(&["a", "bb", "ccc"]),
             mode: AttackMode::BatteringRam,
             read_timeout: Duration::from_secs(2),
             ..Attack::new(addr.ip().to_string(), addr.port(), base)
@@ -417,7 +447,7 @@ mod tests {
         let first_byte = 0..1;
         let attack = Attack {
             positions: vec![first_byte],
-            payloads: vec![vec!["a".into()]],
+            payloads: Attack::payloads_from_str(&["a"]),
             mode: AttackMode::Sniper,
             ..Attack::new(addr.ip().to_string(), addr.port(), Bytes::from_static(b"XGET"))
         };
@@ -428,5 +458,39 @@ mod tests {
         assert!(matches!(err, IntruderError::OutOfScope { .. }));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(seen.lock().await.len(), 0, "nothing should be sent out of scope");
+    }
+
+    /// Payloads are bytes: a value that is not valid UTF-8 must reach the wire
+    /// unchanged, and come back in the result's assignments.
+    #[tokio::test]
+    async fn binary_payload_is_sent_unchanged() {
+        let (addr, seen) = counting_server().await;
+        let base = Bytes::from_static(b"GET /AB HTTP/1.1\r\nHost: t\r\n\r\n");
+        let binary: Payload = vec![0x00, 0xFF, 0x0A, 0x0D];
+        let injection_point = 5..7; // "AB"
+
+        let attack = Attack {
+            positions: vec![injection_point],
+            payloads: vec![vec![binary.clone()]],
+            mode: AttackMode::Sniper,
+            read_timeout: Duration::from_secs(2),
+            ..Attack::new(addr.ip().to_string(), addr.port(), base)
+        };
+        let (results, summary) =
+            run(&attack, &ScopePolicy::host_suffix(&addr.ip().to_string()))
+                .await
+                .unwrap();
+
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.responses, 1);
+        assert_eq!(results[0].assignments, vec![(0, binary.clone())]);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sent = seen.lock().await;
+        assert_eq!(sent.len(), 1, "exactly one request is sent");
+        let mut expected: Vec<u8> = b"GET /".to_vec();
+        expected.extend_from_slice(&binary);
+        expected.extend_from_slice(b" HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert_eq!(sent[0], expected, "payload bytes reach the wire verbatim");
     }
 }

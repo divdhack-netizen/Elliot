@@ -9,6 +9,8 @@ elliot-repeater = { path = "../repeater" }
 
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
 bytes = "1"
+# Bounded, non-spawning concurrency for the attack stream.
+futures = "0.3"
 thiserror = { workspace = true }
 
 [dev-dependencies]

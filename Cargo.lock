@@ -968,6 +968,7 @@ dependencies = [
  "elliot-httpraw",
  "elliot-repeater",
  "elliot-scope",
+ "futures",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -1014,6 +1015,7 @@ dependencies = [
  "elliot-httpraw",
  "elliot-scope",
  "regex",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]
