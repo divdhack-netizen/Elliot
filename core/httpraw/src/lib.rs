@@ -17,6 +17,8 @@ use std::net::SocketAddr;
 use std::time::SystemTime;
 use uuid::Uuid;
 
+pub mod net;
+
 /// A single request/response exchange observed (or produced) by Elliot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Flow {

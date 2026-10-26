@@ -20,6 +20,7 @@ use hudsucker::{
 };
 use uuid::Uuid;
 
+use elliot_httpraw::net::split_host_port;
 use elliot_httpraw::{Scheme, ScopeDecision, WsDirection, WsKind, WsMessage};
 
 use crate::scope::ScopeDecider;
@@ -102,8 +103,10 @@ fn uri_target(uri: &http::Uri) -> (Scheme, String, u16) {
         _ if uri.port_u16() == Some(443) => Scheme::Https,
         _ => Scheme::Http,
     };
-    let host = uri.host().unwrap_or_default().to_string();
-    let port = uri.port_u16().unwrap_or(match scheme {
+    // Host and port come from the shared authority parser, not a local copy.
+    let authority = uri.authority().map(|a| a.as_str()).unwrap_or_default();
+    let (host, port) = split_host_port(authority);
+    let port = port.or_else(|| uri.port_u16()).unwrap_or(match scheme {
         Scheme::Https => 443,
         Scheme::Http => 80,
     });

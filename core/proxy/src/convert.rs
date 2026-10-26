@@ -10,6 +10,7 @@ use http::{Request, Response};
 use http_body_util::BodyExt;
 use hudsucker::Body;
 
+use elliot_httpraw::net::split_host_port;
 use elliot_httpraw::{Header, HttpVersion, Scheme};
 
 /// Split a request into its parts and fully-collected body bytes.
@@ -124,22 +125,6 @@ pub fn target_info(parts: &http::request::Parts) -> (Scheme, String, u16) {
     });
 
     (scheme, host, port)
-}
-
-fn split_host_port(raw: &str) -> (String, Option<u16>) {
-    // IPv6 literal like [::1]:8080
-    if let Some(rest) = raw.strip_prefix('[') {
-        if let Some((addr, tail)) = rest.split_once(']') {
-            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok());
-            return (format!("[{addr}]"), port);
-        }
-    }
-    match raw.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            (h.to_string(), p.parse().ok())
-        }
-        _ => (raw.to_string(), None),
-    }
 }
 
 fn headers_vec(map: &http::HeaderMap) -> Vec<Header> {

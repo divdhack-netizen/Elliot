@@ -173,8 +173,8 @@ pub fn validate(
         _ => {}
     }
     for target in &proposal.targets {
-        let (scheme, host, port, path) = target_locus(target);
-        let decision = scope.decide(scheme, &host, port, path);
+        let locus = elliot_httpraw::net::target_locus(target);
+        let decision = scope.decide(locus.scheme, &locus.host, locus.port, locus.path);
         if decision != ScopeDecision::InScope {
             return Err(RunnerError::OutOfScope {
                 target: target.clone(),
@@ -324,46 +324,6 @@ pub struct Output {
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-}
-
-/// Derive a (scheme, host, port, path) locus from a target string for the
-/// scope check. Best-effort: handles bare hosts, host:port, CIDR (mask
-/// stripped) and URLs; a port-range or unparseable token scope-checks as a
-/// bare host with no port.
-fn target_locus(target: &str) -> (&str, String, u16, &str) {
-    // URL form.
-    if let Some(rest) = target
-        .strip_prefix("http://")
-        .map(|r| ("http", r))
-        .or_else(|| target.strip_prefix("https://").map(|r| ("https", r)))
-    {
-        let (scheme, after) = rest;
-        let (authority, _path) = after.split_once('/').unwrap_or((after, ""));
-        let (host, port) = split_host_port(authority, if scheme == "https" { 443 } else { 80 });
-        return (scheme, host, port, "");
-    }
-    // CIDR: scope-check the network address.
-    let host_part = target.split('/').next().unwrap_or(target);
-    let (host, port) = split_host_port(host_part, 0);
-    ("", host, port, "")
-}
-
-fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
-    if let Some(rest) = authority.strip_prefix('[') {
-        if let Some((addr, tail)) = rest.split_once(']') {
-            let port = tail
-                .strip_prefix(':')
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(default_port);
-            return (format!("[{addr}]"), port);
-        }
-    }
-    match authority.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-            (h.to_string(), p.parse().unwrap_or(default_port))
-        }
-        _ => (authority.to_string(), default_port),
-    }
 }
 
 /// Is `candidate` inside `root` after normalizing `.`/`..` lexically? Rejects
