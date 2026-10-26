@@ -3,15 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use elliot_httpraw::ScopeDecision;
-use elliot_proxy::{start, ProxyConfig, ScopeDecider};
-
-struct DenyAll;
-impl ScopeDecider for DenyAll {
-    fn decide(&self, _s: &str, _h: &str, _p: u16, _path: &str) -> ScopeDecision {
-        ScopeDecision::OutOfScope
-    }
-}
+use elliot_proxy::{start, AllowAll, DenyAll, ProxyConfig};
 
 fn config(dir: &tempfile::TempDir, port: u16) -> ProxyConfig {
     ProxyConfig {
@@ -31,13 +23,6 @@ async fn binds_on_loopback_and_stops() {
     // CA PEM is available for the guided install.
     assert!(handle.ca_pem().contains("BEGIN CERTIFICATE"));
     handle.stop().await;
-}
-
-struct AllowAll;
-impl ScopeDecider for AllowAll {
-    fn decide(&self, _s: &str, _h: &str, _p: u16, _path: &str) -> ScopeDecision {
-        ScopeDecision::InScope
-    }
 }
 
 /// Live MITM check against a real HTTPS host. Needs outbound network and the

@@ -252,6 +252,30 @@ pub trait ScopeDecider: Send + Sync {
     fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision;
 }
 
+/// The trivial always-in-scope decider: everything [`ScopeDecision::InScope`].
+///
+/// Lives here, next to the trait, so every consumer (proxy, runner, intruder,
+/// tests) shares one definition instead of re-declaring its own.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllowAll;
+
+impl ScopeDecider for AllowAll {
+    fn decide(&self, _scheme: &str, _host: &str, _port: u16, _path: &str) -> ScopeDecision {
+        ScopeDecision::InScope
+    }
+}
+
+/// The trivial never-in-scope decider: everything
+/// [`ScopeDecision::OutOfScope`]. The mirror of [`AllowAll`], mainly for tests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenyAll;
+
+impl ScopeDecider for DenyAll {
+    fn decide(&self, _scheme: &str, _host: &str, _port: u16, _path: &str) -> ScopeDecision {
+        ScopeDecision::OutOfScope
+    }
+}
+
 /// Reconstruct the raw bytes of a request from its parsed parts.
 pub fn serialize_request(
     method: &str,
@@ -354,6 +378,18 @@ mod tests {
         assert_eq!(ScopeDecision::InScope.as_token(), "in");
         assert_eq!(ScopeDecision::OutOfScope.as_token(), "out");
         assert_eq!(ScopeDecision::Passthrough.as_token(), "passthrough");
+    }
+
+    #[test]
+    fn trivial_deciders_take_the_expected_decision() {
+        assert_eq!(AllowAll.decide("https", "x", 443, "/"), ScopeDecision::InScope);
+        assert_eq!(
+            DenyAll.decide("https", "x", 443, "/"),
+            ScopeDecision::OutOfScope
+        );
+        // Usable as a shared trait object, the way consumers hold it.
+        let d: std::sync::Arc<dyn ScopeDecider> = std::sync::Arc::new(AllowAll);
+        assert_eq!(d.decide("http", "y", 80, "/"), ScopeDecision::InScope);
     }
 
     #[test]

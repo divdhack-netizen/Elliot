@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 
 pub use elliot_httpraw::{Flow, ScopeDecision, WsDirection, WsKind, WsMessage};
 pub use intercept::InterceptDecision;
-pub use scope::{AllowAll, ScopeDecider};
+pub use scope::{AllowAll, DenyAll, ScopeDecider};
 
 /// Configuration for a proxy instance.
 #[derive(Clone, Debug)]

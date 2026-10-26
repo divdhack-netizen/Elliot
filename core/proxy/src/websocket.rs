@@ -136,14 +136,7 @@ fn classify(message: &Message) -> Option<(WsKind, Bytes)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scope::AllowAll;
-
-    struct DenyAll;
-    impl ScopeDecider for DenyAll {
-        fn decide(&self, _s: &str, _h: &str, _p: u16, _path: &str) -> ScopeDecision {
-            ScopeDecision::OutOfScope
-        }
-    }
+    use crate::scope::{AllowAll, DenyAll};
 
     fn handler(scope: Arc<dyn ScopeDecider>) -> WsHandler {
         let (events, _rx) = tokio::sync::mpsc::channel(4);
