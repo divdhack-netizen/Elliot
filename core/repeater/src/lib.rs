@@ -9,6 +9,16 @@
 //! The response *is* parsed, best-effort, into the shared
 //! [`elliot_httpraw::Response`] for display, but the exact response bytes are
 //! always preserved in [`RepeatResponse::raw`].
+//!
+//! # Scope
+//!
+//! The repeater does **not** consult the scope engine itself: it sends exactly
+//! the bytes it is handed, to whatever host it is pointed at. Scope is enforced
+//! by the caller — `elliot-intruder` checks it before sending anything, and
+//! the proxy only ever surfaces in-scope traffic. Keeping the gate out of this
+//! crate leaves it a pure "send these bytes" primitive; any caller that accepts
+//! a target from outside the app must run it through
+//! [`elliot_httpraw::ScopeDecider`] first.
 
 use std::time::{Duration, Instant};
 

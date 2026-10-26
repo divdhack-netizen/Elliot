@@ -45,7 +45,8 @@ Vedi [../core/README.md](../core/README.md), [../app/README.md](../app/README.md
 
 - **core (Rust, senza UI):** `proxy`, `scope` (fonte di verità unica), `store`
   (SQLite/SQLCipher), `httpraw` (request raw editabile condivisa), `repeater`,
-  `intruder`, `runner` (valida+esegue), `catalog` (loader+validazione).
+  `intruder`, `runner` (valida+esegue), `catalog` (loader+validazione), `tls`
+  (politica TLS: config rustls + verifier permissivo dietro opt-in).
 - **app (Tauri):** `src-tauri` (guscio, IPC, agent bridge) + `src` (React, 4
   schermate). Tab Proxy/Repeater/Intruder/Agente; staccabili in futuro, gratis
   perché lo stato sta nel core.
@@ -199,19 +200,29 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
     self-contained (OpenSSL vendored staticamente, niente OpenSSL di sistema né
     pkg-config — il principio "niente OpenSSL" valeva per il lato rete, qui è
     una copia statica di build). Schema v1 (`PRAGMA user_version`), tabella
-    `flows` con i campi interrogabili + body/raw come BLOB, header come JSON;
-    `create`/`open` (passphrase errata → errore), `upsert_flow`/`get_flow`/
-    `list_flows`/`count_flows`. Migrazioni oltre la v1 = follow-up.
+    `flows` con i campi interrogabili + body/raw come BLOB, header come blob
+    binario length-prefixed (i valori sono byte arbitrari, non UTF-8);
+    `create`/`open` (passphrase errata → errore),
+    `upsert_flow`/`upsert_flows`/`get_flow`/`list_flows`/`count_flows`.
+    Migrazioni oltre la v1 = follow-up.
   - **`elliot-repeater`** — client **raw** TCP/TLS: invia i byte della request
     **verbatim** (nessuna normalizzazione — è il punto del repeater), parsa la
     response best-effort nel tipo condiviso ma conserva sempre i byte grezzi.
-    TLS via rustls (provider aws-lc-rs, niente OpenSSL); framing per
-    Content-Length/chunked/EOF sotto timeout; `accept_invalid_certs` opt-in.
+    TLS via `elliot-tls` (rustls, provider aws-lc-rs, niente OpenSSL);
+    `accept_invalid_certs` opt-in. Framing derivato parsando gli header **una
+    volta** con `httparse` (Transfer-Encoding ha la precedenza su
+    Content-Length) e decoder chunked reale (estensioni, trailer, chunk
+    finale), sotto timeout. Lo scope **non** è controllato qui: il gate è del
+    chiamante.
   - **`elliot-catalog`** — modello tipizzato + loader YAML + validazione che
     rispecchia `catalog/schema/tool-entry.schema.yaml` (deny_unknown_fields,
     `scope_checked` sempre true, string→pattern, path→confined_to+access,
     enum→values, pattern di id/flag). Test: la voce golden `nmap.yaml` carica e
-    valida. Era anch'esso stub ed è dipendenza necessaria del runner.
+    valida. Espone `load_standard()` (voci standard impacchettate con
+    `include_str!`) e `load_file()` (voci `custom`), più un test anti-drift che
+    confronta i `required` di primo livello dello schema con i campi
+    obbligatori del modello Rust. Era anch'esso stub ed è dipendenza necessaria
+    del runner.
   - **`elliot-runner`** — la **frontiera di fiducia in esecuzione**: valida una
     proposta approvata contro la voce di catalogo (allow-list dei flag, vincoli
     di tipo, regex sui valori string, confinamento dei path nel project dir) e
@@ -220,14 +231,47 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
     verifica il binario e **costruisce l'argv** (mai shell); `execute` lancia il
     processo con timeout e cattura stdout/stderr.
   - **`elliot-intruder`** — attacchi multi-punto: injection point (range di byte
-    nella request base), payload set, modi **Sniper/BatteringRam/Pitchfork/
-    ClusterBomb**, espansione dei job, invio concorrente (semaforo) via repeater
-    con metriche per richiesta; **scope controllato una volta prima di inviare**
-    (fuori scope ⇒ non parte nulla).
+    nella request base), payload set **come byte** (`Payload = Vec<u8>`, così i
+    fuzz case non-UTF8 passano), modi **Sniper/BatteringRam/Pitchfork/
+    ClusterBomb**, espansione dei job, invio concorrente **bounded** (uno stream
+    che tira un job solo quando un posto si libera, non uno `spawn` per job) via
+    repeater con metriche per richiesta; **scope controllato una volta prima di
+    inviare** (fuori scope ⇒ non parte nulla). Limite noto: `plan()`
+    materializza ancora l'intera espansione, quindi un cluster bomb enorme è
+    grande in memoria.
+- **Fatto (2026-10-26):** refactoring dei crate core, a comportamento
+  osservabile invariato (48 → 79 test, tutti verdi):
+  - **`elliot-httpraw`** — nuovo modulo `net` con l'unica implementazione di
+    `split_host_port` e del "locus" passato allo scope (il runner e il proxy ne
+    avevano tre copie divergenti, con default port e IPv6 diversi);
+    `AllowAll`/`DenyAll` accanto al trait `ScopeDecider`; token canonici sugli
+    enum (`as_str`/`as_token`/`from_token`) con un test che li congela, perché
+    sono il formato su disco dello store.
+  - **`elliot-tls`** — nuovo crate: `ClientConfig` rustls (webpki roots) e
+    `insecure_client_config()` dietro opt-in esplicito. Il repeater lo usa e
+    perde il proprio `tls.rs`; il proxy lo usa per `verify_upstream=false`.
+  - **`elliot-proxy`** — `verify_upstream=false` **ora implementato davvero**
+    (era accettato e ignorato): connector `hyper-rustls` sulla config
+    permissiva, applicato anche al client WebSocket. Coperto da un test
+    end-to-end su loopback con upstream self-signed.
+  - **`elliot-runner`** — `validate` spezzato in helper puri
+    (`check_tool_match`/`validate_flags`/`validate_targets`/`build_argv`); il
+    confinamento dei path canonicalizza la radice del progetto e risolve il più
+    profondo antenato esistente, quindi **scopre i symlink** che escono (limite
+    TOCTOU residuo documentato); il PATH lookup vive nel modulo privato `which`.
+  - **`elliot-store`** — `upsert_flows` batch in **una** transazione (il proxy
+    scriverà a raffica: un fsync per burst, non per flow); header in blob
+    binario compatto con decoder stretto (input troncato → errore, mai panic).
+    Il formato su disco cambia qui (nessun file reale esisteva); le dipendenze
+    `serde`/`serde_json` dello store sono state rimosse.
+  - **Decisione aperta R10a — il repeater non ha scope-gate.** Scelta esplicita:
+    il gate resta al chiamante (l'intruder lo fa prima di inviare), documentato
+    nel crate. Se in futuro il repeater accettasse target dall'esterno, andrebbe
+    aggiunto un `Option<&dyn ScopeDecider>` a `send`.
 - **Prossimo:** cablare questi crate nell'app — `ScopePolicy` al posto di
   `AllowAll` (comandi Tauri scope + UI), persistenza dei flow nello `store`,
   `runner` dietro l'approvazione umana dell'agente, UI di repeater e intruder —
-  più la UI per i messaggi WebSocket; `elliot-catalog` loader da file/bundle.
+  più la UI per i messaggi WebSocket.
 
 ## Non ancora deciso
 
