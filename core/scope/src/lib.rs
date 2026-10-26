@@ -34,6 +34,8 @@
 //! (ReDoS-prone) pattern. A glob/regex matcher can be added later behind the
 //! same enum if a real need appears.
 
+use std::sync::RwLock;
+
 use serde::{Deserialize, Serialize};
 
 pub use elliot_httpraw::{ScopeDecider, ScopeDecision};
@@ -103,6 +105,60 @@ impl ScopePolicy {
 impl ScopeDecider for ScopePolicy {
     fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision {
         self.evaluate(scheme, host, port, path)
+    }
+}
+
+/// A [`ScopePolicy`] that can be edited while consumers still hold it.
+///
+/// [`ScopeDecider::decide`] takes `&self`, so a decider already handed to a
+/// running proxy cannot be mutated in place. This wrapper keeps the policy
+/// behind a lock and re-reads it on **every** decision, so an edit made in the
+/// UI applies to the next request instead of only at the next proxy start.
+///
+/// There is no `unsafe` and no async here: the lock is held only for the length
+/// of one evaluation.
+#[derive(Debug, Default)]
+pub struct SharedPolicy {
+    policy: RwLock<ScopePolicy>,
+}
+
+impl SharedPolicy {
+    pub fn new(policy: ScopePolicy) -> Self {
+        Self {
+            policy: RwLock::new(policy),
+        }
+    }
+
+    /// The current policy. An empty policy is the safe default: everything is
+    /// tunnelled until the user defines a scope.
+    pub fn get(&self) -> ScopePolicy {
+        self.policy.read().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    /// Replace the policy. Takes effect on the next decision.
+    pub fn set(&self, policy: ScopePolicy) {
+        match self.policy.write() {
+            Ok(mut guard) => *guard = policy,
+            // A poisoned lock means a previous panic while evaluating. Losing the
+            // edit is bad, but a silent half-state would be worse.
+            Err(poisoned) => *poisoned.into_inner() = policy,
+        }
+    }
+
+    /// An `Arc<dyn ScopeDecider>` view to hand to a consumer.
+    pub fn decider(self: &std::sync::Arc<Self>) -> std::sync::Arc<dyn ScopeDecider> {
+        self.clone()
+    }
+}
+
+impl ScopeDecider for SharedPolicy {
+    fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision {
+        match self.policy.read() {
+            Ok(policy) => policy.evaluate(scheme, host, port, path),
+            // A poisoned lock means a previous panic. Fail *safe*: capture nothing
+            // rather than intercept traffic the policy may not have allowed.
+            Err(_) => ScopeDecision::Passthrough,
+        }
     }
 }
 
@@ -375,6 +431,37 @@ mod tests {
             decider.decide("https", "example.com", 443, "/"),
             ScopeDecision::InScope
         );
+    }
+
+    #[test]
+    fn shared_policy_reflects_edits_immediately() {
+        let shared = std::sync::Arc::new(SharedPolicy::default());
+        let decider = shared.decider();
+
+        // Empty policy: nothing is captured.
+        assert_eq!(
+            decider.decide("https", "example.com", 443, "/"),
+            ScopeDecision::Passthrough
+        );
+
+        // Same decider handle, edited policy → the next decision changes.
+        shared.set(ScopePolicy::host_suffix("example.com"));
+        assert_eq!(
+            decider.decide("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        assert_eq!(
+            decider.decide("https", "evil.com", 443, "/"),
+            ScopeDecision::OutOfScope
+        );
+
+        // And back to tunnelling everything.
+        shared.set(ScopePolicy::new());
+        assert_eq!(
+            decider.decide("https", "example.com", 443, "/"),
+            ScopeDecision::Passthrough
+        );
+        assert_eq!(shared.get(), ScopePolicy::new());
     }
 
     #[test]

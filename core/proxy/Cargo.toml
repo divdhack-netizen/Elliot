@@ -30,6 +30,8 @@ thiserror = { workspace = true }
 tracing = "0.1"
 
 [dev-dependencies]
+# A real policy engine for the scope-enforcement test.
+elliot-scope = { path = "../scope" }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "net", "io-util"] }
 # A self-signed loopback HTTPS server for the upstream-verification test.
 tokio-rustls = "0.26"

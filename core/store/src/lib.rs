@@ -37,6 +37,8 @@ pub enum StoreError {
     Db(#[from] rusqlite::Error),
     #[error("header encoding: {0}")]
     HeaderEncoding(String),
+    #[error("project file {path:?} already exists")]
+    AlreadyExists { path: String },
     #[error(
         "schema version mismatch: file is v{found}, this build supports v{supported}"
     )]
@@ -49,16 +51,23 @@ pub struct Store {
 }
 
 impl Store {
-    /// Create a new encrypted project file and initialize the schema. Fails if
-    /// the file already exists so an existing project is never clobbered.
+    /// Create a new encrypted project file and initialize the schema.
+    ///
+    /// Fails if the file already exists, so an existing project is never
+    /// clobbered (SQLite would otherwise happily open it in place).
     pub fn create(path: impl AsRef<Path>, passphrase: &str) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(StoreError::AlreadyExists {
+                path: path.display().to_string(),
+            });
+        }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", passphrase)?;
         // Touch the database so the key actually takes effect, then build it.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        let store = Self { conn };
-        store.init_schema()?;
-        Ok(store)
+        init_schema(&conn)?;
+        Ok(Self { conn })
     }
 
     /// Open an existing encrypted project file. Returns an error if the
@@ -75,40 +84,35 @@ impl Store {
                 supported: SCHEMA_VERSION,
             });
         }
+        // Idempotent, so a file written before a table existed still gains it.
+        init_schema(&conn)?;
         Ok(Self { conn })
     }
 
-    fn init_schema(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS flows (
-                id            TEXT PRIMARY KEY,
-                started_at    INTEGER NOT NULL,
-                completed_at  INTEGER,
-                client_addr   TEXT NOT NULL,
-                scheme        TEXT NOT NULL,
-                host          TEXT NOT NULL,
-                port          INTEGER NOT NULL,
-                method        TEXT NOT NULL,
-                target        TEXT NOT NULL,
-                req_version   TEXT NOT NULL,
-                req_headers   BLOB NOT NULL,
-                req_body      BLOB NOT NULL,
-                req_raw       BLOB NOT NULL,
-                status        INTEGER,
-                resp_reason   TEXT,
-                resp_version  TEXT,
-                resp_headers  BLOB,
-                resp_body     BLOB,
-                resp_raw      BLOB,
-                state         TEXT NOT NULL,
-                scope         TEXT NOT NULL,
-                error         TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_flows_started ON flows (started_at);
-            CREATE INDEX IF NOT EXISTS idx_flows_host ON flows (host);
-            "#,
+    /// Insert or replace a named setting (scope policy, UI preferences, …).
+    /// Values are opaque bytes; the caller owns their format.
+    pub fn set_setting(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// Read a setting, or `None` if it was never written.
+    pub fn get_setting(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Forget a setting. A missing key is not an error.
+    pub fn delete_setting(&self, key: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
     }
 
@@ -165,6 +169,46 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))?)
     }
+}
+
+/// Create the schema. Every statement is `IF NOT EXISTS`, so this is safe on a
+/// fresh file and on one written by an earlier build.
+fn init_schema(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS flows (
+            id            TEXT PRIMARY KEY,
+            started_at    INTEGER NOT NULL,
+            completed_at  INTEGER,
+            client_addr   TEXT NOT NULL,
+            scheme        TEXT NOT NULL,
+            host          TEXT NOT NULL,
+            port          INTEGER NOT NULL,
+            method        TEXT NOT NULL,
+            target        TEXT NOT NULL,
+            req_version   TEXT NOT NULL,
+            req_headers   BLOB NOT NULL,
+            req_body      BLOB NOT NULL,
+            req_raw       BLOB NOT NULL,
+            status        INTEGER,
+            resp_reason   TEXT,
+            resp_version  TEXT,
+            resp_headers  BLOB,
+            resp_body     BLOB,
+            resp_raw      BLOB,
+            state         TEXT NOT NULL,
+            scope         TEXT NOT NULL,
+            error         TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_flows_started ON flows (started_at);
+        CREATE INDEX IF NOT EXISTS idx_flows_host ON flows (host);
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value BLOB NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
 }
 
 const COLUMNS: &str = "id, started_at, completed_at, client_addr, scheme, host, port, \
@@ -469,6 +513,83 @@ mod tests {
         }
         let err = Store::open(&path, "wrong-key");
         assert!(err.is_err(), "opening with the wrong passphrase must fail");
+    }
+
+    /// `create` must never adopt an existing file: that would silently mix two
+    /// projects (SQLite opens a file in place rather than failing).
+    #[test]
+    fn create_refuses_to_clobber_an_existing_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.elliot");
+        {
+            let store = Store::create(&path, "first").unwrap();
+            store.set_setting("k", b"v1").unwrap();
+        }
+        // `.err()` rather than `unwrap_err()`: `Store` is deliberately not
+        // `Debug` (it holds a live keyed connection).
+        let err = Store::create(&path, "second")
+            .err()
+            .expect("an existing project must be refused");
+        assert!(matches!(err, StoreError::AlreadyExists { .. }), "got {err:?}");
+
+        // The original file is untouched.
+        let store = Store::open(&path, "first").unwrap();
+        assert_eq!(store.get_setting("k").unwrap().unwrap(), b"v1".to_vec());
+    }
+
+    #[test]
+    fn settings_round_trip_overwrite_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+
+        assert!(store.get_setting("scope").unwrap().is_none());
+        store.set_setting("scope", b"{\"include\":[]}").unwrap();
+        assert_eq!(
+            store.get_setting("scope").unwrap().unwrap(),
+            b"{\"include\":[]}".to_vec()
+        );
+
+        // Overwrite in place.
+        store.set_setting("scope", b"v2").unwrap();
+        assert_eq!(store.get_setting("scope").unwrap().unwrap(), b"v2".to_vec());
+
+        // Values are opaque bytes, not text.
+        store.set_setting("bin", &[0x00, 0xFF]).unwrap();
+        assert_eq!(store.get_setting("bin").unwrap().unwrap(), vec![0x00, 0xFF]);
+
+        store.delete_setting("scope").unwrap();
+        assert!(store.get_setting("scope").unwrap().is_none());
+        // Deleting a key that is not there is not an error.
+        store.delete_setting("scope").unwrap();
+    }
+
+    #[test]
+    fn settings_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.elliot");
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store.set_setting("scope", b"saved").unwrap();
+        }
+        let store = Store::open(&path, "pw").unwrap();
+        assert_eq!(store.get_setting("scope").unwrap().unwrap(), b"saved".to_vec());
+    }
+
+    /// A file written before the `settings` table existed must still open: the
+    /// schema is ensured idempotently on open.
+    #[test]
+    fn opening_ensures_the_settings_table_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.elliot");
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            // Stand in for an older file that predates the table.
+            store.conn.execute_batch("DROP TABLE settings").unwrap();
+        }
+        let store = Store::open(&path, "pw").unwrap();
+        assert!(store.get_setting("scope").unwrap().is_none());
+        store.set_setting("scope", b"ok").unwrap();
+        assert_eq!(store.get_setting("scope").unwrap().unwrap(), b"ok".to_vec());
     }
 
     #[test]
