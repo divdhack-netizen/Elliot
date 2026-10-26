@@ -12,8 +12,6 @@ elliot-httpraw = { path = "../httpraw" }
 # rest from day one, as decided in docs/architecture.md.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 
-serde = { workspace = true }
-serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = { workspace = true }
 

@@ -63,7 +63,7 @@ pub struct Response {
 
 /// A single header. The value is kept as raw bytes because header values are
 /// not guaranteed to be valid UTF-8.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
     pub name: String,
     pub value: Vec<u8>,

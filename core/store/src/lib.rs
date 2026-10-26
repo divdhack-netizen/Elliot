@@ -9,6 +9,11 @@
 //! synchronous (rusqlite); the app wraps a [`Store`] behind its own lock and
 //! calls it off the UI thread.
 //!
+//! Writes come in two shapes: [`Store::upsert_flow`] for a single flow and
+//! [`Store::upsert_flows`] for a burst in one transaction. Header lists are
+//! stored as a compact length-prefixed binary blob (values are arbitrary
+//! bytes).
+//!
 //! Scope of this first cut: open/create an encrypted file, version the schema,
 //! and upsert / fetch / list [`Flow`]s. Migrations beyond v1, the catalog and
 //! repeater/intruder history, and streaming queries are follow-ups.
@@ -19,7 +24,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
-use elliot_httpraw::{Flow, FlowState, Header, HttpVersion, Request, Response, Scheme, ScopeDecision};
+use elliot_httpraw::{
+    Flow, FlowState, Header, HttpVersion, Request, Response, Scheme, ScopeDecision,
+};
 
 /// Current on-disk schema version, stored in `PRAGMA user_version`.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -28,8 +35,8 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub enum StoreError {
     #[error("database: {0}")]
     Db(#[from] rusqlite::Error),
-    #[error("serialize headers: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("header encoding: {0}")]
+    HeaderEncoding(String),
     #[error(
         "schema version mismatch: file is v{found}, this build supports v{supported}"
     )]
@@ -107,59 +114,23 @@ impl Store {
 
     /// Insert or replace a flow.
     pub fn upsert_flow(&self, flow: &Flow) -> Result<(), StoreError> {
-        let req_headers = serde_json::to_vec(&flow.request.headers)?;
-        let (status, resp_reason, resp_version, resp_headers, resp_body, resp_raw) =
-            match &flow.response {
-                Some(r) => (
-                    Some(i64::from(r.status)),
-                    Some(r.reason.clone()),
-                    Some(r.version.as_token().to_string()),
-                    Some(serde_json::to_vec(&r.headers)?),
-                    Some(r.body.to_vec()),
-                    Some(r.raw.to_vec()),
-                ),
-                None => (None, None, None, None, None, None),
-            };
+        upsert_on(&self.conn, flow)
+    }
 
-        self.conn.execute(
-            r#"
-            INSERT OR REPLACE INTO flows (
-                id, started_at, completed_at, client_addr, scheme, host, port,
-                method, target, req_version, req_headers, req_body, req_raw,
-                status, resp_reason, resp_version, resp_headers, resp_body, resp_raw,
-                state, scope, error
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19,
-                ?20, ?21, ?22
-            )
-            "#,
-            rusqlite::params![
-                flow.id.to_string(),
-                millis(flow.started_at),
-                flow.completed_at.map(millis),
-                flow.client_addr.to_string(),
-                flow.scheme.as_str(),
-                flow.host,
-                i64::from(flow.port),
-                flow.request.method,
-                flow.request.target,
-                flow.request.version.as_token(),
-                req_headers,
-                flow.request.body.to_vec(),
-                flow.request.raw.to_vec(),
-                status,
-                resp_reason,
-                resp_version,
-                resp_headers,
-                resp_body,
-                resp_raw,
-                flow.state.as_token(),
-                flow.scope.as_token(),
-                flow.error,
-            ],
-        )?;
+    /// Insert or replace many flows in **one** transaction.
+    ///
+    /// The capture path produces flows in bursts, and one transaction per burst
+    /// costs a single fsync instead of one per flow. A failure anywhere rolls
+    /// the whole batch back, so a partial burst is never committed.
+    pub fn upsert_flows(&mut self, flows: &[Flow]) -> Result<(), StoreError> {
+        if flows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for flow in flows {
+            upsert_on(&tx, flow)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -201,6 +172,69 @@ const COLUMNS: &str = "id, started_at, completed_at, client_addr, scheme, host, 
      status, resp_reason, resp_version, resp_headers, resp_body, resp_raw, \
      state, scope, error";
 
+/// The single upsert statement, shared by the one-at-a-time and batch writers
+/// so the column list exists in exactly one place.
+const UPSERT_SQL: &str = r#"
+    INSERT OR REPLACE INTO flows (
+        id, started_at, completed_at, client_addr, scheme, host, port,
+        method, target, req_version, req_headers, req_body, req_raw,
+        status, resp_reason, resp_version, resp_headers, resp_body, resp_raw,
+        state, scope, error
+    ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+        ?8, ?9, ?10, ?11, ?12, ?13,
+        ?14, ?15, ?16, ?17, ?18, ?19,
+        ?20, ?21, ?22
+    )
+    "#;
+
+/// Upsert one flow on any connection-ish handle (a `Connection` or the
+/// `Transaction` that derefs to it).
+fn upsert_on(conn: &Connection, flow: &Flow) -> Result<(), StoreError> {
+    let req_headers = encode_headers(&flow.request.headers);
+    let (status, resp_reason, resp_version, resp_headers, resp_body, resp_raw) =
+        match &flow.response {
+            Some(r) => (
+                Some(i64::from(r.status)),
+                Some(r.reason.clone()),
+                Some(r.version.as_token().to_string()),
+                Some(encode_headers(&r.headers)),
+                Some(r.body.to_vec()),
+                Some(r.raw.to_vec()),
+            ),
+            None => (None, None, None, None, None, None),
+        };
+
+    conn.execute(
+        UPSERT_SQL,
+        rusqlite::params![
+            flow.id.to_string(),
+            millis(flow.started_at),
+            flow.completed_at.map(millis),
+            flow.client_addr.to_string(),
+            flow.scheme.as_str(),
+            flow.host,
+            i64::from(flow.port),
+            flow.request.method,
+            flow.request.target,
+            flow.request.version.as_token(),
+            req_headers,
+            flow.request.body.to_vec(),
+            flow.request.raw.to_vec(),
+            status,
+            resp_reason,
+            resp_version,
+            resp_headers,
+            resp_body,
+            resp_raw,
+            flow.state.as_token(),
+            flow.scope.as_token(),
+            flow.error,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Map a row (selected as `COLUMNS`) back into a [`Flow`]. The inner result
 /// carries deserialization errors without aborting the row callback.
 fn row_to_flow(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Flow, StoreError>> {
@@ -235,7 +269,7 @@ fn build_flow(row: &rusqlite::Row<'_>) -> Result<Flow, StoreError> {
         method,
         target,
         version: HttpVersion::from_token(&req_version),
-        headers: serde_json::from_slice(&req_headers)?,
+        headers: decode_headers(&req_headers)?,
         body: req_body.into(),
         raw: req_raw.into(),
     };
@@ -249,7 +283,7 @@ fn build_flow(row: &rusqlite::Row<'_>) -> Result<Flow, StoreError> {
                 .map(HttpVersion::from_token)
                 .unwrap_or(HttpVersion::Http11),
             headers: match resp_headers {
-                Some(h) => serde_json::from_slice::<Vec<Header>>(&h)?,
+                Some(h) => decode_headers(&h)?,
                 None => Vec::new(),
             },
             body: resp_body.unwrap_or_default().into(),
@@ -272,6 +306,66 @@ fn build_flow(row: &rusqlite::Row<'_>) -> Result<Flow, StoreError> {
         scope: ScopeDecision::from_token(&scope),
         error,
     })
+}
+
+// --- header encoding ---------------------------------------------------------
+//
+// Header values are arbitrary bytes, so they are stored length-prefixed rather
+// than as a JSON array of integers (which cost ~4 bytes of text per input
+// byte).
+//
+// Layout: `u32` count, then per header a `u32`-length-prefixed name (UTF-8) and
+// a `u32`-length-prefixed value (raw bytes), all little-endian.
+
+fn encode_headers(headers: &[Header]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + headers.len() * 16);
+    out.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+    for h in headers {
+        let name = h.name.as_bytes();
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&(h.value.len() as u32).to_le_bytes());
+        out.extend_from_slice(&h.value);
+    }
+    out
+}
+
+/// Inverse of [`encode_headers`]. A truncated or inconsistent blob is an error,
+/// never a panic or a silent truncation.
+fn decode_headers(bytes: &[u8]) -> Result<Vec<Header>, StoreError> {
+    let mut cur = bytes;
+    let count = read_u32(&mut cur)? as usize;
+    // Do not trust `count` enough to pre-allocate it.
+    let mut out = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let name_len = read_u32(&mut cur)? as usize;
+        let name = std::str::from_utf8(take(&mut cur, name_len)?)
+            .map_err(|e| StoreError::HeaderEncoding(format!("header name is not UTF-8: {e}")))?
+            .to_string();
+        let value_len = read_u32(&mut cur)? as usize;
+        let value = take(&mut cur, value_len)?.to_vec();
+        out.push(Header { name, value });
+    }
+    Ok(out)
+}
+
+fn read_u32(cur: &mut &[u8]) -> Result<u32, StoreError> {
+    let bytes = take(cur, 4)?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("take(4) yields exactly 4 bytes"),
+    ))
+}
+
+fn take<'a>(cur: &mut &'a [u8], len: usize) -> Result<&'a [u8], StoreError> {
+    if cur.len() < len {
+        return Err(StoreError::HeaderEncoding(format!(
+            "truncated header blob: wanted {len} bytes, {} left",
+            cur.len()
+        )));
+    }
+    let (head, rest) = cur.split_at(len);
+    *cur = rest;
+    Ok(head)
 }
 
 // --- time helpers ------------------------------------------------------------
@@ -375,5 +469,90 @@ mod tests {
         }
         let err = Store::open(&path, "wrong-key");
         assert!(err.is_err(), "opening with the wrong passphrase must fail");
+    }
+
+    #[test]
+    fn batch_upsert_writes_every_flow_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+
+        let flows: Vec<Flow> = (0..25).map(|_| sample_flow()).collect();
+        store.upsert_flows(&flows).unwrap();
+        assert_eq!(store.count_flows().unwrap(), 25);
+        assert!(store.get_flow(flows[7].id).unwrap().is_some());
+
+        // Re-upserting the same ids replaces rather than duplicates.
+        store.upsert_flows(&flows).unwrap();
+        assert_eq!(store.count_flows().unwrap(), 25);
+
+        // An empty batch is a no-op, not an error.
+        store.upsert_flows(&[]).unwrap();
+        assert_eq!(store.count_flows().unwrap(), 25);
+    }
+
+    /// Within one batch, a repeated id replaces rather than duplicates (the
+    /// statement is `INSERT OR REPLACE`).
+    #[test]
+    fn a_repeated_id_within_a_batch_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+
+        let mut first = sample_flow();
+        first.id = Uuid::nil();
+        let mut second = sample_flow();
+        second.id = Uuid::nil();
+
+        store.upsert_flows(&[first, second]).unwrap();
+        assert_eq!(store.count_flows().unwrap(), 1);
+    }
+
+    /// Header values are arbitrary bytes; the compact codec must round-trip them
+    /// (this is what the old JSON encoding could do, but at ~4x the size).
+    #[test]
+    fn non_utf8_header_values_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+
+        let mut flow = sample_flow();
+        flow.request.headers = vec![
+            Header {
+                name: "Host".into(),
+                value: b"example.com".to_vec(),
+            },
+            Header {
+                name: "X-Odd".into(),
+                value: vec![0x00, 0xFF, 0x80, 0x0A, 0x0D],
+            },
+        ];
+        store.upsert_flow(&flow).unwrap();
+
+        let got = store.get_flow(flow.id).unwrap().expect("flow present");
+        assert_eq!(got.request.headers, flow.request.headers);
+    }
+
+    #[test]
+    fn header_codec_round_trips_and_is_strict() {
+        let headers = vec![
+            Header {
+                name: "Host".into(),
+                value: b"example.com".to_vec(),
+            },
+            Header {
+                name: "X-Odd".into(),
+                value: vec![0x00, 0x80, 0xFF],
+            },
+        ];
+        let encoded = encode_headers(&headers);
+        assert_eq!(decode_headers(&encoded).unwrap(), headers);
+        // Binary, length-prefixed — not a JSON array of integers.
+        assert!(encoded.len() < 64, "encoding is {} bytes", encoded.len());
+
+        // Empty list round-trips to empty.
+        assert!(decode_headers(&encode_headers(&[])).unwrap().is_empty());
+
+        // Truncated or inconsistent input is an error, never a panic.
+        assert!(decode_headers(&[]).is_err());
+        assert!(decode_headers(&encoded[..3]).is_err());
+        assert!(decode_headers(&encoded[..encoded.len() - 1]).is_err());
     }
 }
