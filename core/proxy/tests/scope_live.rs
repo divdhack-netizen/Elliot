@@ -1,10 +1,11 @@
 //! End-to-end check that the proxy really enforces the scope policy, and that an
 //! edit made while it runs applies to the next request.
 //!
-//! "Enforced" here means: out-of-scope traffic is still forwarded (it is the
-//! user's own traffic, just not Elliot's business) but produces **no flow
-//! events** — nothing is captured, stored or shown. That is the property the
-//! whole scope feature rests on, so it is asserted against a running proxy
+//! "Enforced" here means: an empty policy captures everything (the default a
+//! fresh install gets), while traffic the policy leaves out is still forwarded
+//! (it is the user's own traffic, just not Elliot's business) but produces **no
+//! flow events** — nothing is captured, stored or shown. That is the property
+//! the whole scope feature rests on, so it is asserted against a running proxy
 //! rather than on a config value.
 //!
 //! Everything is loopback: no outbound network, no external binary.
@@ -108,35 +109,44 @@ async fn scope_decides_capture_and_edits_apply_immediately() {
     .await
     .expect("the proxy should start");
 
-    // 1. Empty policy → Passthrough: forwarded, but nothing captured.
+    // 1. Empty policy: everything is in scope, so the traffic is captured. This
+    //    is the default a fresh install runs with.
     let status = get_through_proxy(proxy_addr, origin)
         .await
         .expect("the first request should complete");
     assert!(status.contains("200"), "got {status:?}");
+    let hosts = captured_hosts(&mut rx, Duration::from_secs(2)).await;
     assert!(
-        captured_hosts(&mut rx, Duration::from_millis(400)).await.is_empty(),
-        "an empty policy must capture nothing"
+        hosts.iter().any(|h| h == "127.0.0.1"),
+        "an empty policy must capture everything, got {hosts:?}"
     );
 
-    // 2. Define the scope. The decider the running proxy already holds must pick
-    //    the change up on the next request.
-    policy.set(ScopePolicy::host_suffix("127.0.0.1"));
+    // 2. Narrow the scope to another host. The decider the running proxy already
+    //    holds must pick the change up on the next request: the request still
+    //    completes, but nothing is captured.
+    policy.set(ScopePolicy::host_suffix("example.com"));
     let status = get_through_proxy(proxy_addr, origin)
         .await
         .expect("the second request should complete");
     assert!(status.contains("200"), "got {status:?}");
+    assert!(
+        captured_hosts(&mut rx, Duration::from_millis(400))
+            .await
+            .is_empty(),
+        "traffic outside the include list must not be captured"
+    );
+
+    // 3. Clearing the include list captures everything again — same handle, no
+    //    restart.
+    policy.set(ScopePolicy::new());
+    let status = get_through_proxy(proxy_addr, origin)
+        .await
+        .expect("the third request should complete");
+    assert!(status.contains("200"), "got {status:?}");
     let hosts = captured_hosts(&mut rx, Duration::from_secs(2)).await;
     assert!(
         hosts.iter().any(|h| h == "127.0.0.1"),
-        "after the edit the flow must be captured, got {hosts:?}"
-    );
-
-    // 3. Clearing the scope stops capturing again — same handle, no restart.
-    policy.set(ScopePolicy::new());
-    let _ = get_through_proxy(proxy_addr, origin).await;
-    assert!(
-        captured_hosts(&mut rx, Duration::from_millis(400)).await.is_empty(),
-        "clearing the scope must stop capture"
+        "clearing the include list must capture everything again, got {hosts:?}"
     );
 
     handle.stop().await;

@@ -128,8 +128,9 @@ function ProjectCard({ api }: { api: ScopeApi }) {
   );
 }
 
-/// One list of rules. The safe default is stated plainly: with no include rule
-/// nothing is captured, which is easy to misread as "the proxy is broken".
+/// One list of rules. Both empty states are spelled out because both are easy
+/// to misread: no include rule captures everything, and an exclusion is a
+/// deliberate blind spot rather than a hidden flow.
 function RuleCard({
   api,
   list,
@@ -163,8 +164,8 @@ function RuleCard({
         {rules.length === 0 ? (
           <p className="muted small">
             {list === "include"
-              ? "Nothing is in scope yet: Elliot tunnels everything and captures nothing."
-              : "No exclusions. Excluded hosts are never intercepted, even if in scope."}
+              ? "No include rules: everything is in scope. Add a rule to narrow capture down."
+              : "No exclusions. An excluded host is tunnelled, never intercepted."}
           </p>
         ) : (
           <>

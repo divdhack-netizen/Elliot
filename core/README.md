@@ -7,7 +7,7 @@ depends on these crates.
 | crate | responsibility |
 |---|---|
 | `proxy` | MITM proxy: local CA + on-the-fly per-host certs, HTTP/1.1, HTTP/2, WebSocket. Produces request/response *flows*. Passive and intercept modes. |
-| `scope` | Scope policy engine. The **single source of truth** for what is in/out of scope. Queried by proxy, intruder, repeater, and the tool runner. Include/exclude rules on scheme/host/port/path; host by exact or domain-suffix match (no regex, safe-by-construction). Empty scope captures nothing (transparent passthrough). |
+| `scope` | Scope policy engine. The **single source of truth** for what is in/out of scope. Queried by proxy, intruder, repeater, and the tool runner. Include/exclude rules on scheme/host/port/path; host by exact or domain-suffix match (no regex, safe-by-construction). An empty scope captures everything; the include list narrows it, exclusions carve targets back out. |
 | `store` | Per-project SQLite store, SQLCipher-encrypted. The project file *is* the database. Bodies as blobs. Flow history, search, the filter DSL. |
 | `httpraw` | The shared **raw-bytes editable request** model and its serializer — deliberately non-normalizing so requests can be malformed. Used by proxy, repeater, intruder. |
 | `repeater` | Takes one request, resends it (via a raw client that does not normalize), returns the response. |

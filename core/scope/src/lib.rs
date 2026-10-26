@@ -11,15 +11,16 @@
 //! A [`ScopePolicy`] is two lists of [`Rule`]s: `include` says what is in scope,
 //! `exclude` carves exceptions back out. A request is evaluated as:
 //!
-//! 1. **No include rules → [`ScopeDecision::Passthrough`].** Safe default: until
-//!    the user defines a scope, Elliot captures *nothing* and tunnels every
-//!    connection transparently (no MITM, no storage). A security proxy should
-//!    not silently intercept and decrypt unrelated traffic (banking, mail, …)
-//!    just by being left running.
+//! 1. **No include rules → [`ScopeDecision::InScope`].** Elliot captures
+//!    *everything* by default. A fresh install behaves like a plain capture
+//!    proxy: start it and the traffic is there, with no scope to define first.
 //! 2. **Matches an exclude rule → [`ScopeDecision::Passthrough`].** Explicitly
-//!    carved out: tunnel it, never MITM it.
+//!    carved out: tunnel it, never MITM it. This is the one rule that applies
+//!    even with no include rule, so "capture all, except my bank" works.
 //! 3. **Matches an include rule (and no exclude) → [`ScopeDecision::InScope`].**
-//! 4. **A scope exists but nothing matches → [`ScopeDecision::OutOfScope`].**
+//! 4. **Include rules exist but nothing matches → [`ScopeDecision::OutOfScope`].**
+//!    The include list *narrows* capture; it is the only way to leave traffic
+//!    alone, and excluding is the explicitly-not-mine signal.
 //!
 //! `Passthrough` and `OutOfScope` both lead the proxy to tunnel without
 //! capturing; they are kept distinct so the UI can tell "explicitly excluded"
@@ -51,9 +52,8 @@ pub struct ScopePolicy {
 }
 
 impl ScopePolicy {
-    /// An empty policy. Captures nothing (everything is [`Passthrough`]).
-    ///
-    /// [`Passthrough`]: ScopeDecision::Passthrough
+    /// An empty policy. Captures everything: no include rule narrows the scope
+    /// and no exclude rule carves anything out.
     pub fn new() -> Self {
         Self::default()
     }
@@ -80,9 +80,6 @@ impl ScopePolicy {
 
     /// Evaluate a target against the policy. See the crate docs for the rules.
     pub fn evaluate(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision {
-        if self.include.is_empty() {
-            return ScopeDecision::Passthrough;
-        }
         if self
             .exclude
             .iter()
@@ -90,10 +87,13 @@ impl ScopePolicy {
         {
             return ScopeDecision::Passthrough;
         }
-        if self
-            .include
-            .iter()
-            .any(|r| r.matches(scheme, host, port, path))
+        // No include rule means "everything is included": the include list only
+        // narrows capture, it never turns it off.
+        if self.include.is_empty()
+            || self
+                .include
+                .iter()
+                .any(|r| r.matches(scheme, host, port, path))
         {
             ScopeDecision::InScope
         } else {
@@ -129,8 +129,7 @@ impl SharedPolicy {
         }
     }
 
-    /// The current policy. An empty policy is the safe default: everything is
-    /// tunnelled until the user defines a scope.
+    /// The current policy. An empty policy captures everything.
     pub fn get(&self) -> ScopePolicy {
         self.policy.read().map(|p| p.clone()).unwrap_or_default()
     }
@@ -330,11 +329,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_policy_tunnels_everything() {
+    fn empty_policy_captures_everything() {
         let p = ScopePolicy::new();
         assert_eq!(
             p.evaluate("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        assert_eq!(
+            p.evaluate("http", "10.0.0.7", 8080, "/a/b"),
+            ScopeDecision::InScope
+        );
+    }
+
+    #[test]
+    fn an_empty_policy_still_honours_excludes() {
+        // "Capture everything except this" has to work without an include rule.
+        let p = ScopePolicy::new().excluding(Rule::host("bank.example"));
+        assert_eq!(
+            p.evaluate("https", "bank.example", 443, "/"),
             ScopeDecision::Passthrough
+        );
+        assert_eq!(
+            p.evaluate("https", "shop.example", 443, "/"),
+            ScopeDecision::InScope
         );
     }
 
@@ -438,10 +455,10 @@ mod tests {
         let shared = std::sync::Arc::new(SharedPolicy::default());
         let decider = shared.decider();
 
-        // Empty policy: nothing is captured.
+        // Empty policy: everything is captured.
         assert_eq!(
             decider.decide("https", "example.com", 443, "/"),
-            ScopeDecision::Passthrough
+            ScopeDecision::InScope
         );
 
         // Same decider handle, edited policy → the next decision changes.
@@ -455,11 +472,11 @@ mod tests {
             ScopeDecision::OutOfScope
         );
 
-        // And back to tunnelling everything.
+        // And clearing the include list captures everything again.
         shared.set(ScopePolicy::new());
         assert_eq!(
-            decider.decide("https", "example.com", 443, "/"),
-            ScopeDecision::Passthrough
+            decider.decide("https", "evil.com", 443, "/"),
+            ScopeDecision::InScope
         );
         assert_eq!(shared.get(), ScopePolicy::new());
     }

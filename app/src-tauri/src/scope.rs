@@ -54,8 +54,8 @@ pub struct ScopeState {
 impl ScopeState {
     pub fn new(default_path: PathBuf) -> Self {
         Self {
-            // An empty policy is the safe default: until the user defines a
-            // scope, everything is tunnelled and nothing is captured.
+            // An empty policy captures everything: a fresh install behaves like a
+            // plain capture proxy, and the include list only narrows it down.
             policy: Arc::new(SharedPolicy::default()),
             project: Mutex::new(None),
             default_path,
@@ -247,12 +247,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_policy_captures_nothing() {
+    async fn an_empty_policy_captures_everything() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path());
         assert_eq!(
             state.decider().decide("https", "example.com", 443, "/"),
-            ScopeDecision::Passthrough
+            ScopeDecision::InScope
         );
         assert!(!state.project_status().await.open);
     }
@@ -265,15 +265,15 @@ mod tests {
         let decider = state.decider();
         assert_eq!(
             decider.decide("https", "example.com", 443, "/"),
-            ScopeDecision::Passthrough
+            ScopeDecision::InScope
         );
 
         // Without a project the edit is live but session-only.
         let policy = ScopePolicy::host_suffix("example.com");
         assert!(!state.set_policy(policy.clone()).await.unwrap());
         assert_eq!(
-            decider.decide("https", "example.com", 443, "/"),
-            ScopeDecision::InScope
+            decider.decide("https", "evil.com", 443, "/"),
+            ScopeDecision::OutOfScope
         );
 
         // With a project it is persisted too.

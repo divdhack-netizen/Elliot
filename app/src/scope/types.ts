@@ -23,6 +23,9 @@ export type ProjectStatus = {
   defaultPath: string;
 };
 
+/// A policy with nothing in it. This is the default the backend starts from and
+/// it captures everything: the include list narrows capture, exclusions carve
+/// targets back out.
 export const EMPTY_POLICY: ScopePolicy = { include: [], exclude: [] };
 
 /// A rule that constrains nothing; a building block the UI edits from.

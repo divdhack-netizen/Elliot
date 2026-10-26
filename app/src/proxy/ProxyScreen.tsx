@@ -121,13 +121,13 @@ export function ProxyScreen() {
           </button>
           <button className={sub === "scope" ? "active" : ""} onClick={() => setSub("scope")}>
             Scope
-            {/* An empty scope means nothing is captured — easy to misread as a
-                broken proxy, so it is flagged rather than shown as "0". */}
+            {/* No include rule captures everything, which a bare count of 0
+                would not say. */}
             {scope.policy.include.length > 0 ? (
               <span className="count">{scope.policy.include.length}</span>
             ) : (
-              <span className="count warn" title="Nothing is in scope: nothing is captured">
-                !
+              <span className="count" title="No include rule: everything is in scope">
+                all
               </span>
             )}
             {scope.project?.open && <span className="dot ok tiny" title="Scope is saved to the project file" />}

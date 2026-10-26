@@ -178,10 +178,11 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
 - **Fatto (2026-10-26):** crate **`elliot-scope`** — il motore di policy, fonte
   di verità unica. `ScopePolicy { include, exclude }` di `Rule` (matcher per
   scheme/host/porta/path), serializzabile (vivrà nel file di progetto).
-  Valutazione: nessuna include → `Passthrough` (**default sicuro**: finché
-  l'utente non definisce uno scope non si cattura né si decifra nulla, tutto in
-  tunnel trasparente); match su exclude → `Passthrough` (escluso esplicito);
-  match su include → `InScope`; scope presente ma nessun match → `OutOfScope`.
+  Valutazione: nessuna include → `InScope` (**default: si cattura tutto**, come
+  un proxy di cattura appena avviato — la lista include *restringe*, non accende);
+  match su exclude → `Passthrough` (escluso esplicito, l'unica regola che vale
+  anche senza include); match su include → `InScope`; include presente ma nessun
+  match → `OutOfScope`.
   Host per **esatto** o **suffisso di dominio** (`.example.com` ⇒ apex +
   sottodomini), case-insensitive; **niente regex** di proposito (coerente con la
   safe-by-construction del catalogo: nessun pattern ReDoS — deviazione
@@ -281,10 +282,10 @@ davvero** un file esistente: prima lo documentava soltanto e SQLite lo avrebbe
   aperto in place, mescolando due progetti. UI: sub-tab **Scope** nella
   schermata Proxy, con file di progetto e liste include/exclude (scheme, host
   esatto o dominio+sottodomini, porta, prefisso di path); con lista include
-  vuota il badge avvisa, perché la policy vuota **non cattura nulla**. Verificato
-  da un test end-to-end sul proxy reale: policy vuota ⇒ la richiesta passa ma non
-  viene catturata; definirla ⇒ catturata; azzerarla ⇒ smette — sempre sullo
-  stesso processo.
+  vuota il badge mostra `all`, perché la policy vuota **cattura tutto**. Verificato
+  da un test end-to-end sul proxy reale: policy vuota ⇒ catturata; ristretta a un
+  altro host ⇒ la richiesta passa ma non viene catturata; azzerata ⇒ catturata di
+  nuovo — sempre sullo stesso processo.
 - **Prossimo:** persistenza dei flow nello `store` dal proxy, `runner` dietro
   l'approvazione umana dell'agente, UI di repeater e intruder, più la UI per i
   messaggi WebSocket.
