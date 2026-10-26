@@ -19,13 +19,19 @@
 //! runs it. The human-confirmation step lives above the runner (in the UI); the
 //! runner's job is to make sure an approved proposal is *safe to run as given*.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use regex::Regex;
 
-use elliot_catalog::{Access, Cardinality, ConfinedTo, FlagType, Intrusiveness, Privilege, ToolEntry};
+use elliot_catalog::{
+    Access, Cardinality, ConfinedTo, FlagType, Intrusiveness, Privilege, TargetKind, ToolEntry,
+};
 use elliot_httpraw::{ScopeDecider, ScopeDecision};
+
+mod which;
+use which::find_in_path;
 
 /// Runner configuration: the confinement root and the dangerous-unlock switch.
 #[derive(Clone, Debug)]
@@ -105,6 +111,8 @@ pub enum RunnerError {
     CardinalityAtLeastOne,
     #[error("path {path:?} escapes the project directory")]
     PathEscapesProject { path: String },
+    #[error("cannot resolve project path {path:?}: {reason}")]
+    PathUnresolved { path: String, reason: String },
     #[error("dangerous effective intrusiveness refused (manual unlock required)")]
     DangerousBlocked,
     #[error("binary {0:?} not found on PATH")]
@@ -116,25 +124,66 @@ pub enum RunnerError {
 }
 
 /// Validate a proposal against its catalog entry, scope and config.
+///
+/// A thin orchestrator: each rule lives in its own pure helper below, so it can
+/// be read — and tested — on its own.
 pub fn validate(
     entry: &ToolEntry,
     proposal: &Proposal,
     scope: &dyn ScopeDecider,
     config: &RunnerConfig,
 ) -> Result<ValidatedCommand, RunnerError> {
+    check_tool_match(entry, proposal)?;
+    let flags = validate_flags(entry, &proposal.flags, config)?;
+    validate_targets(&proposal.targets, entry, scope)?;
+
+    if flags.effective == Intrusiveness::Dangerous && !config.allow_dangerous {
+        return Err(RunnerError::DangerousBlocked);
+    }
+
+    Ok(ValidatedCommand {
+        program: entry.binary.clone(),
+        argv: build_argv(entry, flags.argv, &proposal.targets),
+        effective_intrusiveness: flags.effective,
+        required_privileges: flags.privileges,
+    })
+}
+
+/// The proposal must name the entry it is validated against.
+fn check_tool_match(entry: &ToolEntry, proposal: &Proposal) -> Result<(), RunnerError> {
     if proposal.tool_id != entry.id {
         return Err(RunnerError::ToolMismatch {
             proposal: proposal.tool_id.clone(),
             entry: entry.id.clone(),
         });
     }
+    Ok(())
+}
 
-    let mut effective = entry.base_intrusiveness;
-    let mut required_privileges = Vec::new();
-    let mut argv: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+/// Result of validating the proposed flags.
+struct FlagValidation {
+    /// Flag names and values, in proposal order, ready to prefix the argv.
+    argv: Vec<String>,
+    /// `max(tool base, every used flag)`.
+    effective: Intrusiveness,
+    /// OS capabilities the used flags declared, deduplicated.
+    privileges: Vec<Privilege>,
+}
 
-    for arg in &proposal.flags {
+/// Validate every proposed flag against the allow-list and build their argv.
+fn validate_flags(
+    entry: &ToolEntry,
+    args: &[FlagArg],
+    config: &RunnerConfig,
+) -> Result<FlagValidation, RunnerError> {
+    let mut out = FlagValidation {
+        argv: Vec::new(),
+        effective: entry.base_intrusiveness,
+        privileges: Vec::new(),
+    };
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+
+    for arg in args {
         let spec = entry
             .flag(&arg.name)
             .ok_or_else(|| RunnerError::UnknownFlag(arg.name.clone()))?;
@@ -148,31 +197,39 @@ pub fn validate(
         validate_flag_value(spec, arg, config)?;
 
         if let Some(level) = spec.intrusiveness {
-            effective = effective.max(level);
+            out.effective = out.effective.max(level);
         }
         if let Some(priv_) = spec.requires_privilege {
-            if !required_privileges.contains(&priv_) {
-                required_privileges.push(priv_);
+            if !out.privileges.contains(&priv_) {
+                out.privileges.push(priv_);
             }
         }
 
-        argv.push(arg.name.clone());
+        out.argv.push(arg.name.clone());
         if let Some(v) = &arg.value {
-            argv.push(v.clone());
+            out.argv.push(v.clone());
         }
     }
+    Ok(out)
+}
 
-    // Targets: cardinality + scope.
+/// Enforce the target cardinality, then the scope gate: every target must come
+/// back [`ScopeDecision::InScope`] or nothing is run.
+fn validate_targets(
+    targets: &[String],
+    entry: &ToolEntry,
+    scope: &dyn ScopeDecider,
+) -> Result<(), RunnerError> {
     match entry.target.cardinality {
-        Cardinality::One if proposal.targets.len() != 1 => {
-            return Err(RunnerError::CardinalityOne(proposal.targets.len()));
+        Cardinality::One if targets.len() != 1 => {
+            return Err(RunnerError::CardinalityOne(targets.len()));
         }
-        Cardinality::OneOrMore if proposal.targets.is_empty() => {
+        Cardinality::OneOrMore if targets.is_empty() => {
             return Err(RunnerError::CardinalityAtLeastOne);
         }
         _ => {}
     }
-    for target in &proposal.targets {
+    for target in targets {
         let locus = elliot_httpraw::net::target_locus(target);
         let decision = scope.decide(locus.scheme, &locus.host, locus.port, locus.path);
         if decision != ScopeDecision::InScope {
@@ -182,26 +239,21 @@ pub fn validate(
             });
         }
     }
-    // Append targets as a flag value or positionals, per the entry.
-    for target in &proposal.targets {
-        if entry.target.kind == elliot_catalog::TargetKind::Flag {
+    Ok(())
+}
+
+/// Append the targets to the flag argv, per the entry's target kind.
+fn build_argv(entry: &ToolEntry, flag_argv: Vec<String>, targets: &[String]) -> Vec<String> {
+    let mut argv = flag_argv;
+    for target in targets {
+        if entry.target.kind == TargetKind::Flag {
             if let Some(flag) = &entry.target.flag {
                 argv.push(flag.clone());
             }
         }
         argv.push(target.clone());
     }
-
-    if effective == Intrusiveness::Dangerous && !config.allow_dangerous {
-        return Err(RunnerError::DangerousBlocked);
-    }
-
-    Ok(ValidatedCommand {
-        program: entry.binary.clone(),
-        argv,
-        effective_intrusiveness: effective,
-        required_privileges,
-    })
+    argv
 }
 
 fn validate_flag_value(
@@ -273,7 +325,8 @@ fn validate_flag_value(
             })?;
             // Only project_dir confinement exists today.
             let ConfinedTo::ProjectDir = spec.confined_to.unwrap_or(ConfinedTo::ProjectDir);
-            if !is_within(&config.project_dir, Path::new(v)) {
+            let root = canonical_project_dir(&config.project_dir)?;
+            if !is_within(&root, Path::new(v))? {
                 return Err(RunnerError::PathEscapesProject {
                     path: v.to_string(),
                 });
@@ -326,59 +379,77 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 
-/// Is `candidate` inside `root` after normalizing `.`/`..` lexically? Rejects
-/// traversal without touching the filesystem (the file may not exist yet).
-fn is_within(root: &Path, candidate: &Path) -> bool {
+/// Resolve the confinement root to a real, canonical path. It must exist: every
+/// confinement decision is made relative to it, and a path that cannot be
+/// resolved gives no honest answer, so this fails loudly instead of guessing.
+fn canonical_project_dir(dir: &Path) -> Result<PathBuf, RunnerError> {
+    std::fs::canonicalize(dir).map_err(|e| RunnerError::PathUnresolved {
+        path: dir.display().to_string(),
+        reason: e.to_string(),
+    })
+}
+
+/// Is `candidate` confined to the (already canonical) `root`?
+///
+/// Two layers:
+/// 1. a purely lexical filter that rejects any `..` component without touching
+///    the filesystem;
+/// 2. a symlink-aware check: the deepest existing ancestor is canonicalized and
+///    the not-yet-existing remainder re-attached, so a link *inside* the project
+///    that points outside is caught even though its lexical path looks confined.
+///
+/// Residual limit (TOCTOU): between this check and the tool opening the path, a
+/// process that can already write inside the project directory could swap a
+/// component for a symlink. Closing that needs `openat`-style confinement at
+/// open time and is out of scope here.
+fn is_within(root: &Path, candidate: &Path) -> Result<bool, RunnerError> {
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Ok(false);
+    }
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         root.join(candidate)
     };
-    let root = lexical_normalize(root);
-    let joined = lexical_normalize(&joined);
-    joined.starts_with(&root)
+    Ok(resolve_existing_ancestor(&joined)?.starts_with(root))
 }
 
-fn lexical_normalize(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
+/// Canonicalize `path`, tolerating a tail that does not exist yet.
+///
+/// `std::fs::canonicalize` needs the whole path to exist; an output file usually
+/// does not. So walk up to the deepest existing ancestor, canonicalize that
+/// (resolving every symlink on the way), and re-attach the missing components.
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, RunnerError> {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
             }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
+            Err(e) => match (current.file_name(), current.parent()) {
+                // Keep the component, then retry with the parent.
+                (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                    missing.push(name.to_os_string());
+                    current = parent.to_path_buf();
+                }
+                // Ran out of components without resolving: report, never panic.
+                _ => {
+                    return Err(RunnerError::PathUnresolved {
+                        path: path.display().to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            },
         }
     }
-    out
-}
-
-/// Locate `bin` the way the OS would: an explicit path is checked directly,
-/// otherwise each `PATH` entry is scanned for an executable file.
-fn find_in_path(bin: &str) -> Option<PathBuf> {
-    let p = Path::new(bin);
-    if p.components().count() > 1 {
-        return is_executable(p).then(|| p.to_path_buf());
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(bin);
-        is_executable(&candidate).then_some(candidate)
-    })
-}
-
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &Path) -> bool {
-    p.is_file()
 }
 
 #[cfg(test)]
@@ -489,34 +560,92 @@ mod tests {
 
     #[test]
     fn path_flag_confined_to_project_dir() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = RunnerConfig::new(project.path());
+
         // Inside is fine.
         let inside = Proposal {
             tool_id: "nmap".into(),
             flags: vec![FlagArg::valued("-oX", "out/scan.xml")],
             targets: vec!["a.example.com".into()],
         };
-        assert!(validate(
-            &nmap(),
-            &inside,
-            &scope_allow("example.com"),
-            &RunnerConfig::new("/tmp/project")
-        )
-        .is_ok());
+        assert!(validate(&nmap(), &inside, &scope_allow("example.com"), &cfg).is_ok());
 
-        // Traversal escapes and is rejected.
-        let outside = Proposal {
+        // Lexical traversal escapes and is rejected.
+        let traversal = Proposal {
             tool_id: "nmap".into(),
             flags: vec![FlagArg::valued("-oX", "../../etc/passwd")],
             targets: vec!["a.example.com".into()],
         };
+        let err =
+            validate(&nmap(), &traversal, &scope_allow("example.com"), &cfg).unwrap_err();
+        assert!(matches!(err, RunnerError::PathEscapesProject { .. }));
+
+        // An absolute path outside the project is rejected too.
+        let absolute = Proposal {
+            tool_id: "nmap".into(),
+            flags: vec![FlagArg::valued("-oX", "/etc/passwd")],
+            targets: vec!["a.example.com".into()],
+        };
+        let err = validate(&nmap(), &absolute, &scope_allow("example.com"), &cfg).unwrap_err();
+        assert!(matches!(err, RunnerError::PathEscapesProject { .. }));
+    }
+
+    /// A symlink *inside* the project that points outside must not become an
+    /// escape hatch: the lexical path looks confined, the resolved one is not.
+    #[test]
+    #[cfg(unix)]
+    fn path_flag_rejects_symlink_escaping_the_project() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("escape")).unwrap();
+
+        let proposal = Proposal {
+            tool_id: "nmap".into(),
+            flags: vec![FlagArg::valued("-oX", "escape/scan.xml")],
+            targets: vec!["a.example.com".into()],
+        };
         let err = validate(
             &nmap(),
-            &outside,
+            &proposal,
             &scope_allow("example.com"),
-            &RunnerConfig::new("/tmp/project"),
+            &RunnerConfig::new(project.path()),
         )
         .unwrap_err();
-        assert!(matches!(err, RunnerError::PathEscapesProject { .. }));
+        assert!(
+            matches!(err, RunnerError::PathEscapesProject { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A confinement root that does not exist yields a clear error, not a panic
+    /// and not a silently-allowed path.
+    #[test]
+    fn path_flag_reports_an_unresolvable_project_dir() {
+        let proposal = Proposal {
+            tool_id: "nmap".into(),
+            flags: vec![FlagArg::valued("-oX", "out/scan.xml")],
+            targets: vec!["a.example.com".into()],
+        };
+        let err = validate(
+            &nmap(),
+            &proposal,
+            &scope_allow("example.com"),
+            &RunnerConfig::new("/definitely/not/a/real/project/dir"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunnerError::PathUnresolved { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_within_filters_parent_components_without_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(!is_within(&root, Path::new("../outside")).unwrap());
+        assert!(is_within(&root, Path::new("nested/new.xml")).unwrap());
     }
 
     #[tokio::test]
