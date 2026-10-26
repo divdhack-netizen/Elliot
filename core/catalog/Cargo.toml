@@ -4,6 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+# YAML is the authored catalog format (schema + entries).
+serde_yaml = "0.9"
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

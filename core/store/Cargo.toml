@@ -4,6 +4,22 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+elliot-httpraw = { path = "../httpraw" }
+
+# SQLite + SQLCipher, statically bundled with a vendored OpenSSL so the build is
+# self-contained (no system OpenSSL / pkg-config needed, matching the project's
+# "portable single file" goal). SQLCipher gives us passphrase encryption at
+# rest from day one, as decided in docs/architecture.md.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+bytes = "1"
 
 [lints]
 workspace = true

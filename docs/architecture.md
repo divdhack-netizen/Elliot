@@ -191,13 +191,46 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
   intruder dipendono solo dal trait. 9 unit test (match, include/exclude,
   default, case-insensitive, round-trip JSON, trait object); `clippy -D warnings`
   verde su tutto il workspace.
-- **Prossimo:** cablare `ScopePolicy` nell'app al posto di `AllowAll` (comandi
-  Tauri per leggere/scrivere lo scope + UI), poi gli altri crate stub (`store`,
-  `repeater`, `intruder`, `runner`) e la UI per i messaggi WebSocket.
+- **Fatto (2026-10-26):** gli ultimi crate core stub, ora implementati e testati
+  (`cargo test --workspace` + `clippy -D warnings` verdi):
+  - **`elliot-store`** — file di progetto SQLite **cifrato con SQLCipher**
+    (passphrase, come deciso). `rusqlite` con feature
+    `bundled-sqlcipher-vendored-openssl`: cifratura reale a riposo e build
+    self-contained (OpenSSL vendored staticamente, niente OpenSSL di sistema né
+    pkg-config — il principio "niente OpenSSL" valeva per il lato rete, qui è
+    una copia statica di build). Schema v1 (`PRAGMA user_version`), tabella
+    `flows` con i campi interrogabili + body/raw come BLOB, header come JSON;
+    `create`/`open` (passphrase errata → errore), `upsert_flow`/`get_flow`/
+    `list_flows`/`count_flows`. Migrazioni oltre la v1 = follow-up.
+  - **`elliot-repeater`** — client **raw** TCP/TLS: invia i byte della request
+    **verbatim** (nessuna normalizzazione — è il punto del repeater), parsa la
+    response best-effort nel tipo condiviso ma conserva sempre i byte grezzi.
+    TLS via rustls (provider aws-lc-rs, niente OpenSSL); framing per
+    Content-Length/chunked/EOF sotto timeout; `accept_invalid_certs` opt-in.
+  - **`elliot-catalog`** — modello tipizzato + loader YAML + validazione che
+    rispecchia `catalog/schema/tool-entry.schema.yaml` (deny_unknown_fields,
+    `scope_checked` sempre true, string→pattern, path→confined_to+access,
+    enum→values, pattern di id/flag). Test: la voce golden `nmap.yaml` carica e
+    valida. Era anch'esso stub ed è dipendenza necessaria del runner.
+  - **`elliot-runner`** — la **frontiera di fiducia in esecuzione**: valida una
+    proposta approvata contro la voce di catalogo (allow-list dei flag, vincoli
+    di tipo, regex sui valori string, confinamento dei path nel project dir) e
+    contro lo scope (ogni target deve essere `InScope`), calcola l'intrusività
+    effettiva = max(tool, flag), rifiuta `dangerous` senza sblocco manuale,
+    verifica il binario e **costruisce l'argv** (mai shell); `execute` lancia il
+    processo con timeout e cattura stdout/stderr.
+  - **`elliot-intruder`** — attacchi multi-punto: injection point (range di byte
+    nella request base), payload set, modi **Sniper/BatteringRam/Pitchfork/
+    ClusterBomb**, espansione dei job, invio concorrente (semaforo) via repeater
+    con metriche per richiesta; **scope controllato una volta prima di inviare**
+    (fuori scope ⇒ non parte nulla).
+- **Prossimo:** cablare questi crate nell'app — `ScopePolicy` al posto di
+  `AllowAll` (comandi Tauri scope + UI), persistenza dei flow nello `store`,
+  `runner` dietro l'approvazione umana dell'agente, UI di repeater e intruder —
+  più la UI per i messaggi WebSocket; `elliot-catalog` loader da file/bundle.
 
 ## Non ancora deciso
 
-- Topologia esatta Rust↔Python del sidecar (stdin/stdout vs socket locale).
 - Formato e DSL dei filtri del proxy.
 - Modalità "raw" manuale per l'utente esperto (valvola di sfogo fuori allow-list,
   con conferma, non disponibile all'agente).

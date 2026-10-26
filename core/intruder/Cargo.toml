@@ -4,6 +4,16 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+elliot-httpraw = { path = "../httpraw" }
+elliot-repeater = { path = "../repeater" }
+
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
+bytes = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+elliot-scope = { path = "../scope" }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread", "net", "io-util"] }
 
 [lints]
 workspace = true
