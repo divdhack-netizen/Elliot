@@ -18,6 +18,8 @@
 //! Deserialization handles the shape; [`ToolEntry::validate`] enforces the
 //! cross-field rules. [`ToolEntry::load`] does both.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 /// Risk level. Ordered: `passive < low < intrusive < dangerous`.
@@ -180,6 +182,40 @@ pub enum CatalogError {
     Parse(#[from] serde_yaml::Error),
     #[error("invalid entry: {0}")]
     Invalid(String),
+    #[error("read {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// The bundled `standard/` catalog, compiled into the binary.
+///
+/// Listed explicitly rather than globbed (no `include_dir` dependency): adding a
+/// standard entry means adding a line here, and `standard_catalog_loads` fails
+/// if a listed entry is invalid.
+const STANDARD_CATALOG: &[&str] = &[include_str!("../../../catalog/standard/nmap.yaml")];
+
+/// Load and validate **every** bundled standard entry.
+///
+/// The standard catalog ships inside the binary, so this never touches the
+/// filesystem.
+pub fn load_standard() -> Result<Vec<ToolEntry>, CatalogError> {
+    STANDARD_CATALOG
+        .iter()
+        .map(|yaml| ToolEntry::load(yaml))
+        .collect()
+}
+
+/// Load and validate one user-authored (`custom`) entry from disk.
+pub fn load_file(path: impl AsRef<Path>) -> Result<ToolEntry, CatalogError> {
+    let path = path.as_ref();
+    let yaml = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    ToolEntry::load(&yaml)
 }
 
 impl ToolEntry {
@@ -348,6 +384,94 @@ flags: []
 "#;
         let err = ToolEntry::load(yaml).unwrap_err();
         assert!(matches!(err, CatalogError::Invalid(_)));
+    }
+
+    #[test]
+    fn standard_catalog_loads_with_unique_ids() {
+        let entries = load_standard().expect("the bundled standard catalog must load");
+        assert!(!entries.is_empty(), "the standard catalog cannot be empty");
+
+        let mut ids = std::collections::HashSet::new();
+        for entry in &entries {
+            entry
+                .validate()
+                .unwrap_or_else(|e| panic!("{} failed validation: {e}", entry.id));
+            assert!(ids.insert(entry.id.clone()), "duplicate catalog id: {}", entry.id);
+        }
+    }
+
+    #[test]
+    fn load_file_reads_a_custom_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.yaml");
+        std::fs::write(
+            &path,
+            r#"
+id: prober
+binary: prober
+source: custom
+description: a custom entry
+base_intrusiveness: passive
+target: { kind: positional, type: host, cardinality: one, scope_checked: true }
+flags: []
+"#,
+        )
+        .unwrap();
+
+        let entry = load_file(&path).expect("a well-formed custom entry loads");
+        assert_eq!(entry.id, "prober");
+        assert_eq!(entry.source, Source::Custom);
+    }
+
+    #[test]
+    fn load_file_reports_a_missing_file() {
+        let err = load_file("/definitely/not/a/real/entry.yaml").unwrap_err();
+        assert!(matches!(err, CatalogError::Io { .. }), "got {err:?}");
+    }
+
+    /// Best-effort drift guard between the JSON Schema and the Rust model.
+    ///
+    /// This is **not** a JSON Schema validator: it only compares the schema's
+    /// top-level `required` list with the fields the Rust model treats as
+    /// required (a field is required here when it has no `#[serde(default)]`).
+    /// Nested rules (`target`, `flags`) are not covered.
+    #[test]
+    fn top_level_required_fields_match_the_model() {
+        let schema = include_str!("../../../catalog/schema/tool-entry.schema.yaml");
+        assert_eq!(
+            top_level_required(schema),
+            vec![
+                "id",
+                "binary",
+                "source",
+                "description",
+                "base_intrusiveness",
+                "target",
+                "flags",
+            ],
+            "schema and ToolEntry have drifted apart"
+        );
+    }
+
+    /// Pull the top-level (unindented) `required:` list out of the schema YAML.
+    fn top_level_required(schema: &str) -> Vec<String> {
+        for line in schema.lines() {
+            // Indented `required:` lists belong to nested objects; skip them.
+            let Some(rest) = line.strip_prefix("required:") else {
+                continue;
+            };
+            let inner = rest
+                .trim()
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("unexpected `required` syntax: {rest:?}"));
+            return inner
+                .split(',')
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+                .collect();
+        }
+        panic!("the schema has no top-level `required:` list");
     }
 
     #[test]
