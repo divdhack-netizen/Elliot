@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rustls_pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use elliot_httpraw::{Header, HttpVersion, Response};
@@ -133,7 +133,7 @@ pub async fn send(req: RepeatRequest) -> Result<RepeatResponse, RepeatError> {
 /// Write the raw request verbatim, then read the response under a timeout.
 async fn exchange<S>(stream: &mut S, raw: &[u8], timeout: Duration) -> Result<Bytes, RepeatError>
 where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     stream.write_all(raw).await.map_err(RepeatError::Write)?;
     stream.flush().await.map_err(RepeatError::Write)?;
@@ -144,11 +144,15 @@ where
     }
 }
 
-/// Read an HTTP response, framing it by `Content-Length`, chunked terminator,
-/// or connection close, whichever comes first.
+/// Read an HTTP response, framing it by `Transfer-Encoding: chunked`,
+/// `Content-Length`, or connection close, whichever applies.
+///
+/// The header block is parsed **once** with `httparse` — the same parser
+/// [`parse_response`] uses — to decide the framing, so the headers are never
+/// scanned by hand. The bytes returned are always the raw bytes off the wire.
 async fn read_response<S>(stream: &mut S) -> Result<Bytes, RepeatError>
 where
-    S: AsyncReadExt + Unpin,
+    S: AsyncRead + Unpin,
 {
     let mut buf = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
@@ -159,8 +163,9 @@ where
         // Decide completeness from what we already have.
         if header_end.is_none() {
             if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-                header_end = Some(pos + 4);
-                framing = Some(detect_framing(&buf[..pos + 4]));
+                let end = pos + 4;
+                header_end = Some(end);
+                framing = Some(parse_framing(&buf[..end]));
             }
         }
         if let (Some(hend), Some(f)) = (header_end, framing.as_ref()) {
@@ -183,38 +188,122 @@ where
 enum Framing {
     /// Exact body length is known.
     ContentLength(usize),
-    /// Body is chunked; complete at the terminal `0\r\n\r\n`.
+    /// Body is chunked; complete at the terminal chunk plus its trailer section.
     Chunked,
     /// No length signalled; complete only at connection close.
     UntilClose,
 }
 
-fn detect_framing(headers: &[u8]) -> Framing {
-    // Case-insensitive header scan over the already-terminated header block.
-    let text = headers;
-    if let Some(len) = header_value(text, b"content-length")
-        .and_then(|v| std::str::from_utf8(v).ok())
-        .and_then(|s| s.trim().parse::<usize>().ok())
-    {
-        return Framing::ContentLength(len);
+/// Decide the body framing from the (already terminated) header block using
+/// `httparse`, rather than a hand-rolled header scan.
+fn parse_framing(head: &[u8]) -> Framing {
+    let mut headers = [httparse::EMPTY_HEADER; 128];
+    let mut parsed = httparse::Response::new(&mut headers);
+    // A header block that does not parse cannot be framed from its headers.
+    if !matches!(parsed.parse(head), Ok(httparse::Status::Complete(_))) {
+        return Framing::UntilClose;
     }
-    if let Some(te) = header_value(text, b"transfer-encoding") {
-        if contains_ignore_ascii_case(te, b"chunked") {
+
+    let mut content_length = None;
+    for h in parsed.headers.iter() {
+        // Transfer-Encoding wins over Content-Length when both appear
+        // (RFC 7230 §3.3.3) — checking it first also keeps a smuggled
+        // Content-Length from shortening the read.
+        if h.name.eq_ignore_ascii_case("transfer-encoding")
+            && h.value
+                .split(|&b| b == b',')
+                .any(|token| trim_ascii(token).eq_ignore_ascii_case(b"chunked"))
+        {
             return Framing::Chunked;
         }
+        if h.name.eq_ignore_ascii_case("content-length") {
+            content_length = std::str::from_utf8(h.value)
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok());
+        }
     }
-    Framing::UntilClose
+    match content_length {
+        Some(len) => Framing::ContentLength(len),
+        None => Framing::UntilClose,
+    }
 }
 
 fn is_complete(buf: &[u8], header_end: usize, framing: &Framing) -> bool {
     match framing {
-        Framing::ContentLength(len) => buf.len() >= header_end + len,
-        // Terminal chunk; good enough for well-behaved servers.
-        Framing::Chunked => {
-            buf.len() >= header_end && find_subslice(&buf[header_end..], b"0\r\n\r\n").is_some()
-        }
+        // `saturating_sub` keeps a bogus huge Content-Length from overflowing.
+        Framing::ContentLength(len) => buf.len().saturating_sub(header_end) >= *len,
+        Framing::Chunked => chunked_complete(&buf[header_end.min(buf.len())..]),
         Framing::UntilClose => false,
     }
+}
+
+/// Is the chunked body that follows the headers complete?
+///
+/// Walks chunk by chunk — `size[;extension] CRLF`, then the data and its CRLF —
+/// until the terminal zero-length chunk, whose (possibly empty) trailer section
+/// ends at a blank line. Anything not yet fully received, or malformed, returns
+/// `false` so the reader keeps going (the read timeout bounds the wait).
+fn chunked_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(line_end) = find_subslice(body, b"\r\n") else {
+            return false;
+        };
+        let line = &body[..line_end];
+        // A chunk extension (everything after `;`) is legal but ignored.
+        let size_field = match line.iter().position(|&b| b == b';') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let Ok(size) = parse_chunk_size(size_field) else {
+            return false;
+        };
+        body = &body[line_end + 2..];
+
+        if size == 0 {
+            // Trailer section: zero or more header lines, ended by a blank one.
+            let mut rest = body;
+            loop {
+                let Some(end) = find_subslice(rest, b"\r\n") else {
+                    return false;
+                };
+                if end == 0 {
+                    return true;
+                }
+                rest = &rest[end + 2..];
+            }
+        }
+
+        // The chunk data and its trailing CRLF must both be present.
+        // `get` (not `size + 2`) so a huge declared size cannot overflow.
+        let Some(rest) = body.get(size..) else {
+            return false;
+        };
+        if !rest.starts_with(b"\r\n") {
+            return false;
+        }
+        body = &rest[2..];
+    }
+}
+
+/// Parse a hexadecimal chunk size. Rejects empty or non-hex input and cannot
+/// overflow (a bogus size simply reports "not complete yet").
+fn parse_chunk_size(field: &[u8]) -> Result<usize, ()> {
+    let field = trim_ascii(field);
+    if field.is_empty() {
+        return Err(());
+    }
+    let mut value: usize = 0;
+    for &b in field {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return Err(()),
+        };
+        value = value.checked_mul(16).ok_or(())?;
+        value = value.checked_add(usize::from(digit)).ok_or(())?;
+    }
+    Ok(value)
 }
 
 /// Best-effort parse of raw response bytes into the shared model.
@@ -263,29 +352,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|w| w == needle)
 }
 
-/// Find the first value of `name` (lowercase) in a header block.
-fn header_value<'a>(block: &'a [u8], name_lower: &[u8]) -> Option<&'a [u8]> {
-    for line in block.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let (n, v) = line.split_at(colon);
-            if n.eq_ignore_ascii_case(name_lower) {
-                return Some(trim_ascii(&v[1..]));
-            }
-        }
-    }
-    None
-}
-
-fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|w| w.eq_ignore_ascii_case(needle))
-}
-
 fn trim_ascii(mut s: &[u8]) -> &[u8] {
     while let [first, rest @ ..] = s {
         if first.is_ascii_whitespace() {
@@ -312,7 +378,7 @@ mod tests {
     /// Spawn a one-shot TCP server that records the request bytes it received
     /// and replies with `response`. Returns (addr, join handle yielding request).
     async fn one_shot(
-        response: &'static [u8],
+        response: Vec<u8>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -322,7 +388,7 @@ mod tests {
             let mut got = vec![0u8; 4096];
             let n = sock.read(&mut got).await.unwrap();
             got.truncate(n);
-            sock.write_all(response).await.unwrap();
+            sock.write_all(&response).await.unwrap();
             sock.flush().await.unwrap();
             drop(sock);
             got
@@ -332,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_bytes_verbatim_and_parses_response() {
-        let (addr, server) = one_shot(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").await;
+        let (addr, server) = one_shot(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec()).await;
         // A deliberately odd request line the repeater must not touch.
         let raw = b"GeT /x HTTP/1.1\r\nHost: t\r\nX-Odd:  weird \r\n\r\n".to_vec();
 
@@ -351,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_body_until_close_without_content_length() {
-        let (addr, _server) = one_shot(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+        let (addr, _server) = one_shot(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()).await;
         let res = send(RepeatRequest::new(
             addr.ip().to_string(),
             addr.port(),
@@ -382,9 +448,105 @@ mod tests {
         assert!(matches!(err, RepeatError::Timeout), "got {err:?}");
     }
 
+    #[tokio::test]
+    async fn reads_multi_chunk_chunked_response() {
+        let response: Vec<u8> =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                .to_vec();
+        let expected = response.clone();
+        let (addr, _server) = one_shot(response).await;
+
+        let res = send(RepeatRequest::new(
+            addr.ip().to_string(),
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(&res.raw[..], &expected[..], "raw chunked bytes are preserved");
+        assert_eq!(res.response.expect("parseable").status, 200);
+    }
+
+    #[tokio::test]
+    async fn chunked_decoder_handles_extensions_and_trailers() {
+        // `;name=value` on the data chunk and a trailer after the terminal one.
+        let response: Vec<u8> = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb;name=value\r\nhello world\r\n0\r\nX-Trailer: done\r\n\r\n".to_vec();
+        let expected = response.clone();
+        let (addr, _server) = one_shot(response).await;
+
+        let res = send(RepeatRequest::new(
+            addr.ip().to_string(),
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(&res.raw[..], &expected[..]);
+    }
+
+    /// Regression for the old framing: the raw body *contains* the byte
+    /// sequence `0\r\n\r\n`, so the previous substring-based check declared the
+    /// response complete halfway through. The decoder must instead wait for the
+    /// real terminal chunk. The server splits the write so the false positive
+    /// window is real, and keeps the socket open so a close cannot mask it.
+    #[tokio::test]
+    async fn chunked_body_containing_terminator_is_not_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut ignore = [0u8; 4096];
+            let _ = sock.read(&mut ignore).await;
+            // First chunk header plus a prefix of its data, ending right after
+            // the embedded `0\r\n\r\n`.
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nX0\r\n\r\n")
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Rest of the chunk data, then the terminal chunk.
+            sock.write_all(b"Y\r\n0\r\n\r\n").await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let res = send(RepeatRequest::new(
+            addr.ip().to_string(),
+            addr.port(),
+            b"GET / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+
+        let expected =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nX0\r\n\r\nY\r\n0\r\n\r\n";
+        assert_eq!(&res.raw[..], &expected[..], "the whole chunked body is read");
+    }
+
     #[test]
-    fn header_value_is_case_insensitive() {
-        let block = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
-        assert_eq!(header_value(block, b"content-length"), Some(&b"42"[..]));
+    fn chunk_size_parsing_is_bounded_and_strict() {
+        assert_eq!(parse_chunk_size(b"0"), Ok(0));
+        assert_eq!(parse_chunk_size(b"b"), Ok(11));
+        assert_eq!(parse_chunk_size(b"1A"), Ok(26));
+        assert_eq!(parse_chunk_size(b" 10 "), Ok(16));
+        assert!(parse_chunk_size(b"").is_err());
+        assert!(parse_chunk_size(b"zz").is_err());
+        // A size that would overflow reports "not a size", never a panic.
+        assert!(parse_chunk_size(b"FFFFFFFFFFFFFFFFFFFFFFFF").is_err());
+    }
+
+    #[test]
+    fn chunked_completeness_needs_the_terminal_chunk() {
+        assert!(!chunked_complete(b"5\r\nhello\r\n"));
+        assert!(chunked_complete(b"5\r\nhello\r\n0\r\n\r\n"));
+        assert!(chunked_complete(b"0\r\n\r\n"));
+        // Terminal chunk with a trailer section.
+        assert!(chunked_complete(b"0\r\nX: y\r\n\r\n"));
+        // Trailer section started but not terminated yet.
+        assert!(!chunked_complete(b"0\r\nX: y\r\n"));
+        // Chunk data shorter than declared.
+        assert!(!chunked_complete(b"7\r\nhello\r\n"));
     }
 }
