@@ -1,14 +1,13 @@
-//! Scope abstraction. The proxy depends on a trait, not on the `elliot-scope`
-//! crate, so Phase A can run with [`AllowAll`] and `elliot-scope` can implement
-//! [`ScopeDecider`] later without a reverse dependency.
+//! Scope abstraction for the proxy.
+//!
+//! The [`ScopeDecider`] trait is the shared contract and lives in
+//! `elliot-httpraw`; it is re-exported here (and from the crate root) so the
+//! proxy's public API is unchanged. The proxy depends only on the trait, never
+//! on the `elliot-scope` crate, so Phase A can run with [`AllowAll`] and
+//! `elliot-scope` can provide the real engine without a reverse dependency.
 
+pub use elliot_httpraw::ScopeDecider;
 use elliot_httpraw::ScopeDecision;
-
-/// Decides whether traffic is in scope, out of scope, or should be tunnelled
-/// transparently (passthrough).
-pub trait ScopeDecider: Send + Sync {
-    fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision;
-}
 
 /// Everything is in scope. Useful for Phase A and tests.
 pub struct AllowAll;

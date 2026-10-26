@@ -977,6 +977,11 @@ version = "0.0.0"
 [[package]]
 name = "elliot-scope"
 version = "0.0.0"
+dependencies = [
+ "elliot-httpraw",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "elliot-store"

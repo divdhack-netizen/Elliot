@@ -174,10 +174,26 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
   (`ProxyScreen`, `FlowTable`, `MessageViewer`, `InterceptView`, `CaDialog`,
   filtri, hook `useProxy`, `backend.ts`) + comando Tauri
   `app/src-tauri/src/proxy.rs` e `.claude/launch.json` per l'avvio.
-- **Prossimo:** crate `elliot-scope` (il `ScopeDecider` vero al posto di
-  `AllowAll`; fonte di verità unica da cui dipendono proxy/repeater/intruder),
-  poi gli altri crate stub (`store`, `repeater`, `intruder`, `runner`) e la UI
-  per i messaggi WebSocket nella schermata Proxy.
+- **Fatto (2026-10-26):** crate **`elliot-scope`** — il motore di policy, fonte
+  di verità unica. `ScopePolicy { include, exclude }` di `Rule` (matcher per
+  scheme/host/porta/path), serializzabile (vivrà nel file di progetto).
+  Valutazione: nessuna include → `Passthrough` (**default sicuro**: finché
+  l'utente non definisce uno scope non si cattura né si decifra nulla, tutto in
+  tunnel trasparente); match su exclude → `Passthrough` (escluso esplicito);
+  match su include → `InScope`; scope presente ma nessun match → `OutOfScope`.
+  Host per **esatto** o **suffisso di dominio** (`.example.com` ⇒ apex +
+  sottodomini), case-insensitive; **niente regex** di proposito (coerente con la
+  safe-by-construction del catalogo: nessun pattern ReDoS — deviazione
+  consapevole dalla riga "host/port/path/regex" di `core/README.md`, estendibile
+  dietro lo stesso enum se servirà). Il trait `ScopeDecider` è stato **spostato
+  in `elliot-httpraw`** (contratto condiviso) e ri-esportato da `elliot-proxy`:
+  così `elliot-scope` lo implementa senza dipendere dal proxy, e proxy/repeater/
+  intruder dipendono solo dal trait. 9 unit test (match, include/exclude,
+  default, case-insensitive, round-trip JSON, trait object); `clippy -D warnings`
+  verde su tutto il workspace.
+- **Prossimo:** cablare `ScopePolicy` nell'app al posto di `AllowAll` (comandi
+  Tauri per leggere/scrivere lo scope + UI), poi gli altri crate stub (`store`,
+  `repeater`, `intruder`, `runner`) e la UI per i messaggi WebSocket.
 
 ## Non ancora deciso
 

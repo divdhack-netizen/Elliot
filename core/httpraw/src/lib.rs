@@ -162,6 +162,18 @@ pub enum ScopeDecision {
     Passthrough,
 }
 
+/// Decides whether traffic is in scope (capture + MITM), out of scope, or
+/// should be tunnelled transparently (passthrough).
+///
+/// This is the shared contract between the scope engine (`elliot-scope`) and
+/// its consumers (the proxy today; the repeater, intruder and tool runner
+/// next). It lives here, in the common model crate, so that neither side has
+/// to depend on the other's crate: consumers take `Arc<dyn ScopeDecider>`,
+/// `elliot-scope` implements it, and the app wires the two together.
+pub trait ScopeDecider: Send + Sync {
+    fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision;
+}
+
 /// Reconstruct the raw bytes of a request from its parsed parts.
 pub fn serialize_request(
     method: &str,
