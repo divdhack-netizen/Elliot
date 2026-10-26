@@ -76,10 +76,20 @@ pub enum Scheme {
 }
 
 impl Scheme {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
     pub fn as_str(self) -> &'static str {
         match self {
             Scheme::Http => "http",
             Scheme::Https => "https",
+        }
+    }
+
+    /// Inverse of [`Scheme::as_str`]. Unknown tokens fall back to `Http`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "https" => Scheme::Https,
+            _ => Scheme::Http,
         }
     }
 }
@@ -107,6 +117,25 @@ impl HttpVersion {
         match self {
             HttpVersion::Http10 => "HTTP/1.0",
             HttpVersion::Http11 | HttpVersion::H2 => "HTTP/1.1",
+        }
+    }
+
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            HttpVersion::Http10 => "1.0",
+            HttpVersion::Http11 => "1.1",
+            HttpVersion::H2 => "2",
+        }
+    }
+
+    /// Inverse of [`HttpVersion::as_token`]. Unknown tokens fall back to 1.1.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "1.0" => HttpVersion::Http10,
+            "2" => HttpVersion::H2,
+            _ => HttpVersion::Http11,
         }
     }
 }
@@ -157,11 +186,58 @@ pub enum FlowState {
     Error,
 }
 
+impl FlowState {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            FlowState::Pending => "pending",
+            FlowState::Paused => "paused",
+            FlowState::Completed => "completed",
+            FlowState::Dropped => "dropped",
+            FlowState::Error => "error",
+        }
+    }
+
+    /// Inverse of [`FlowState::as_token`]. Unknown tokens fall back to `Pending`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "paused" => FlowState::Paused,
+            "completed" => FlowState::Completed,
+            "dropped" => FlowState::Dropped,
+            "error" => FlowState::Error,
+            _ => FlowState::Pending,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScopeDecision {
     InScope,
     OutOfScope,
     Passthrough,
+}
+
+impl ScopeDecision {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            ScopeDecision::InScope => "in",
+            ScopeDecision::OutOfScope => "out",
+            ScopeDecision::Passthrough => "passthrough",
+        }
+    }
+
+    /// Inverse of [`ScopeDecision::as_token`]. Unknown tokens fall back to
+    /// `InScope`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "out" => ScopeDecision::OutOfScope,
+            "passthrough" => ScopeDecision::Passthrough,
+            _ => ScopeDecision::InScope,
+        }
+    }
 }
 
 /// Decides whether traffic is in scope (capture + MITM), out of scope, or
@@ -255,5 +331,60 @@ mod tests {
         assert_eq!(HttpVersion::H2.wire_token(), "HTTP/1.1");
         let raw = serialize_request("GET", "/", HttpVersion::H2, &[], b"");
         assert_eq!(&raw[..], b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    /// These exact strings are written to (and read back from) the SQLCipher
+    /// project file by `elliot-store`. Changing any of them silently would
+    /// break every existing `.elliot` project, so they are pinned here.
+    #[test]
+    fn enum_tokens_are_frozen_for_the_store() {
+        assert_eq!(Scheme::Http.as_str(), "http");
+        assert_eq!(Scheme::Https.as_str(), "https");
+
+        assert_eq!(HttpVersion::Http10.as_token(), "1.0");
+        assert_eq!(HttpVersion::Http11.as_token(), "1.1");
+        assert_eq!(HttpVersion::H2.as_token(), "2");
+
+        assert_eq!(FlowState::Pending.as_token(), "pending");
+        assert_eq!(FlowState::Paused.as_token(), "paused");
+        assert_eq!(FlowState::Completed.as_token(), "completed");
+        assert_eq!(FlowState::Dropped.as_token(), "dropped");
+        assert_eq!(FlowState::Error.as_token(), "error");
+
+        assert_eq!(ScopeDecision::InScope.as_token(), "in");
+        assert_eq!(ScopeDecision::OutOfScope.as_token(), "out");
+        assert_eq!(ScopeDecision::Passthrough.as_token(), "passthrough");
+    }
+
+    #[test]
+    fn enum_tokens_round_trip_and_degrade_safely() {
+        for v in [Scheme::Http, Scheme::Https] {
+            assert_eq!(Scheme::from_token(v.as_str()), v);
+        }
+        for v in [HttpVersion::Http10, HttpVersion::Http11, HttpVersion::H2] {
+            assert_eq!(HttpVersion::from_token(v.as_token()), v);
+        }
+        for v in [
+            FlowState::Pending,
+            FlowState::Paused,
+            FlowState::Completed,
+            FlowState::Dropped,
+            FlowState::Error,
+        ] {
+            assert_eq!(FlowState::from_token(v.as_token()), v);
+        }
+        for v in [
+            ScopeDecision::InScope,
+            ScopeDecision::OutOfScope,
+            ScopeDecision::Passthrough,
+        ] {
+            assert_eq!(ScopeDecision::from_token(v.as_token()), v);
+        }
+
+        // An unknown token must degrade to the safe default, never panic.
+        assert_eq!(Scheme::from_token("gopher"), Scheme::Http);
+        assert_eq!(HttpVersion::from_token("9"), HttpVersion::Http11);
+        assert_eq!(FlowState::from_token("weird"), FlowState::Pending);
+        assert_eq!(ScopeDecision::from_token("weird"), ScopeDecision::InScope);
     }
 }

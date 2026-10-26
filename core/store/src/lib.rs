@@ -113,7 +113,7 @@ impl Store {
                 Some(r) => (
                     Some(i64::from(r.status)),
                     Some(r.reason.clone()),
-                    Some(version_str(r.version).to_string()),
+                    Some(r.version.as_token().to_string()),
                     Some(serde_json::to_vec(&r.headers)?),
                     Some(r.body.to_vec()),
                     Some(r.raw.to_vec()),
@@ -140,12 +140,12 @@ impl Store {
                 millis(flow.started_at),
                 flow.completed_at.map(millis),
                 flow.client_addr.to_string(),
-                scheme_str(flow.scheme),
+                flow.scheme.as_str(),
                 flow.host,
                 i64::from(flow.port),
                 flow.request.method,
                 flow.request.target,
-                version_str(flow.request.version),
+                flow.request.version.as_token(),
                 req_headers,
                 flow.request.body.to_vec(),
                 flow.request.raw.to_vec(),
@@ -155,8 +155,8 @@ impl Store {
                 resp_headers,
                 resp_body,
                 resp_raw,
-                state_str(flow.state),
-                scope_str(flow.scope),
+                flow.state.as_token(),
+                flow.scope.as_token(),
                 flow.error,
             ],
         )?;
@@ -234,7 +234,7 @@ fn build_flow(row: &rusqlite::Row<'_>) -> Result<Flow, StoreError> {
     let request = Request {
         method,
         target,
-        version: version_from(&req_version),
+        version: HttpVersion::from_token(&req_version),
         headers: serde_json::from_slice(&req_headers)?,
         body: req_body.into(),
         raw: req_raw.into(),
@@ -244,7 +244,10 @@ fn build_flow(row: &rusqlite::Row<'_>) -> Result<Flow, StoreError> {
         Some(code) => Some(Response {
             status: code as u16,
             reason: resp_reason.unwrap_or_default(),
-            version: resp_version.as_deref().map(version_from).unwrap_or(HttpVersion::Http11),
+            version: resp_version
+                .as_deref()
+                .map(HttpVersion::from_token)
+                .unwrap_or(HttpVersion::Http11),
             headers: match resp_headers {
                 Some(h) => serde_json::from_slice::<Vec<Header>>(&h)?,
                 None => Vec::new(),
@@ -260,18 +263,22 @@ fn build_flow(row: &rusqlite::Row<'_>) -> Result<Flow, StoreError> {
         started_at: from_millis(started_at),
         completed_at: completed_at.map(from_millis),
         client_addr: client_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-        scheme: scheme_from(&scheme),
+        scheme: Scheme::from_token(&scheme),
         host,
         port: port as u16,
         request,
         response,
-        state: state_from(&state),
-        scope: scope_from(&scope),
+        state: FlowState::from_token(&state),
+        scope: ScopeDecision::from_token(&scope),
         error,
     })
 }
 
-// --- enum <-> text + time helpers -------------------------------------------
+// --- time helpers ------------------------------------------------------------
+//
+// Enum names are NOT mapped here: the on-disk tokens live next to the enums in
+// `elliot-httpraw` (`as_str` / `as_token` / `from_token`), so there is a single
+// definition of the store format.
 
 fn millis(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH)
@@ -280,68 +287,6 @@ fn millis(t: SystemTime) -> i64 {
 }
 fn from_millis(ms: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
-}
-
-fn scheme_str(s: Scheme) -> &'static str {
-    match s {
-        Scheme::Http => "http",
-        Scheme::Https => "https",
-    }
-}
-fn scheme_from(s: &str) -> Scheme {
-    match s {
-        "https" => Scheme::Https,
-        _ => Scheme::Http,
-    }
-}
-
-fn version_str(v: HttpVersion) -> &'static str {
-    match v {
-        HttpVersion::Http10 => "1.0",
-        HttpVersion::Http11 => "1.1",
-        HttpVersion::H2 => "2",
-    }
-}
-fn version_from(v: &str) -> HttpVersion {
-    match v {
-        "1.0" => HttpVersion::Http10,
-        "2" => HttpVersion::H2,
-        _ => HttpVersion::Http11,
-    }
-}
-
-fn state_str(s: FlowState) -> &'static str {
-    match s {
-        FlowState::Pending => "pending",
-        FlowState::Paused => "paused",
-        FlowState::Completed => "completed",
-        FlowState::Dropped => "dropped",
-        FlowState::Error => "error",
-    }
-}
-fn state_from(s: &str) -> FlowState {
-    match s {
-        "paused" => FlowState::Paused,
-        "completed" => FlowState::Completed,
-        "dropped" => FlowState::Dropped,
-        "error" => FlowState::Error,
-        _ => FlowState::Pending,
-    }
-}
-
-fn scope_str(s: ScopeDecision) -> &'static str {
-    match s {
-        ScopeDecision::InScope => "in",
-        ScopeDecision::OutOfScope => "out",
-        ScopeDecision::Passthrough => "passthrough",
-    }
-}
-fn scope_from(s: &str) -> ScopeDecision {
-    match s {
-        "out" => ScopeDecision::OutOfScope,
-        "passthrough" => ScopeDecision::Passthrough,
-        _ => ScopeDecision::InScope,
-    }
 }
 
 #[cfg(test)]
