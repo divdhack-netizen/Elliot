@@ -157,16 +157,27 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
   rifiuta i bind non-loopback) e **Fase B** (intercept — `intercept.rs`,
   `set_intercept`/`decide`) implementate; `AllowAll` come decider finché
   `elliot-scope` non è pronto. Esempio `examples/run.rs` + smoke test
-  `tests/smoke.rs`. **Fase C (HTTP/2 esplicito)** e **Fase D (WebSocket)**
-  ancora da fare (nessun `websocket.rs`).
+  `tests/smoke.rs`.
+- **Fatto (2026-10-26):** proxy Fasi **C** e **D**. Fase C (HTTP/2): feature
+  `http2` di hudsucker attiva e `HttpVersion::from_http` mappa `HTTP_2 → H2`
+  nel `Flow` (cattura h2 trasparente; il `raw` ricostruito usa comunque la
+  start-line 1.1, h2 non ne ha una testuale — best-effort documentato). Fase D
+  (WebSocket): nuovo `websocket.rs` con un `WebSocketHandler` **observe-only**
+  (inoltra i frame intatti) che emette `ProxyEvent::WebSocket(WsMessage)` per i
+  messaggi su connessioni in-scope; tipi `WsMessage`/`WsDirection`/`WsKind` in
+  `elliot-httpraw`; scope ri-controllato lato WS (fuori scope = non catturato;
+  il `wss` fuori scope è già tunnelato senza MITM). L'editing/intercept dei
+  frame WS e lo stitching al flow di upgrade restano follow-up. Verifica:
+  `cargo test` (mappatura h2 + classify/scope WS) e `clippy -D warnings` verdi
+  sull'intero workspace; esempio `run` e glue Tauri estesi al nuovo evento.
 - **Fatto (2026-10-26):** UI della schermata **Proxy** — `app/src/proxy/`
   (`ProxyScreen`, `FlowTable`, `MessageViewer`, `InterceptView`, `CaDialog`,
   filtri, hook `useProxy`, `backend.ts`) + comando Tauri
   `app/src-tauri/src/proxy.rs` e `.claude/launch.json` per l'avvio.
 - **Prossimo:** crate `elliot-scope` (il `ScopeDecider` vero al posto di
   `AllowAll`; fonte di verità unica da cui dipendono proxy/repeater/intruder),
-  poi le Fasi C/D del proxy e gli altri crate stub (`store`, `repeater`,
-  `intruder`, `runner`).
+  poi gli altri crate stub (`store`, `repeater`, `intruder`, `runner`) e la UI
+  per i messaggi WebSocket nella schermata Proxy.
 
 ## Non ancora deciso
 

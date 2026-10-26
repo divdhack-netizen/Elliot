@@ -30,6 +30,14 @@ async fn main() -> anyhow::Result<()> {
                 f.response.map(|r| r.status).unwrap_or(0)
             ),
             ProxyEvent::FlowUpdated(f) => println!("PAUSE {} {}", f.host, f.request.target),
+            ProxyEvent::WebSocket(m) => println!(
+                "WS    {:?} {:?} {}:{} ({} bytes)",
+                m.direction,
+                m.kind,
+                m.host,
+                m.port,
+                m.payload.len()
+            ),
             ProxyEvent::Error(e) => println!("ERR   {e}"),
         }
     }

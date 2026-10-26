@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use elliot_httpraw::Flow;
+use elliot_httpraw::{Flow, WsMessage};
 use elliot_proxy::{
     start, AllowAll, InterceptDecision, ProxyConfig, ProxyEvent, ProxyHandle,
 };
@@ -30,11 +30,14 @@ fn default_verify() -> bool {
     true
 }
 
-/// How a flow event reaches the frontend. `kind` distinguishes the lifecycle.
+/// How a flow event reaches the frontend. `kind` distinguishes the lifecycle;
+/// `ws` carries a WebSocket message when `kind == "ws"`.
 #[derive(Debug, Serialize, Clone)]
 struct FlowEvent {
     kind: &'static str,
     flow: Option<Flow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws: Option<WsMessage>,
     error: Option<String>,
 }
 
@@ -84,10 +87,11 @@ pub async fn proxy_start(
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let payload = match ev {
-                ProxyEvent::FlowStarted(f) => FlowEvent { kind: "started", flow: Some(f), error: None },
-                ProxyEvent::FlowUpdated(f) => FlowEvent { kind: "updated", flow: Some(f), error: None },
-                ProxyEvent::FlowCompleted(f) => FlowEvent { kind: "completed", flow: Some(f), error: None },
-                ProxyEvent::Error(e) => FlowEvent { kind: "error", flow: None, error: Some(e) },
+                ProxyEvent::FlowStarted(f) => FlowEvent { kind: "started", flow: Some(f), ws: None, error: None },
+                ProxyEvent::FlowUpdated(f) => FlowEvent { kind: "updated", flow: Some(f), ws: None, error: None },
+                ProxyEvent::FlowCompleted(f) => FlowEvent { kind: "completed", flow: Some(f), ws: None, error: None },
+                ProxyEvent::WebSocket(m) => FlowEvent { kind: "ws", flow: None, ws: Some(m), error: None },
+                ProxyEvent::Error(e) => FlowEvent { kind: "error", flow: None, ws: None, error: Some(e) },
             };
             let _ = app_for_pump.emit("proxy://flow", payload);
         }

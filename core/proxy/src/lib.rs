@@ -18,6 +18,7 @@ mod handler;
 mod intercept;
 mod scope;
 mod tls;
+mod websocket;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-pub use elliot_httpraw::{Flow, ScopeDecision};
+pub use elliot_httpraw::{Flow, ScopeDecision, WsDirection, WsKind, WsMessage};
 pub use intercept::InterceptDecision;
 pub use scope::{AllowAll, ScopeDecider};
 
@@ -59,6 +60,8 @@ pub enum ProxyEvent {
     FlowUpdated(Flow),
     /// A flow finished (response received, dropped, or errored).
     FlowCompleted(Flow),
+    /// A WebSocket message observed on an in-scope connection (Phase D).
+    WebSocket(WsMessage),
     /// A proxy-level error not attached to a specific flow.
     Error(String),
 }

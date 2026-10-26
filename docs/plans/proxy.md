@@ -305,17 +305,28 @@ hudsucker), `rcgen` (se non si usa l'authority di hudsucker), `http`, `bytes`,
   invia la decisione; `Drop` interrompe; `ForwardEdited` modifica la request a
   valle.
 
-### Fase C — HTTP/2
+### Fase C — HTTP/2 — ✅ FATTA (2026-10-26)
 
-- Abilitare h2 nel client/relay hudsucker (spesso trasparente). Mappare la
-  versione su `HttpVersion::H2` nel `Flow`.
-- **Verifica:** un sito solo-h2 viene catturato con `version = H2`.
+- Feature `http2` di hudsucker attiva; `HttpVersion::from_http` mappa
+  `HTTP_2 → H2` nel `Flow` (cattura h2 trasparente). Il `raw` ricostruito usa
+  comunque la start-line `HTTP/1.1` perché h2 non ne ha una testuale — vista
+  best-effort, documentata in `httpraw`.
+- **Verifica:** unit test `http2_version_maps_and_serializes_as_1_1` in
+  `elliot-httpraw`.
 
-### Fase D — WebSocket
+### Fase D — WebSocket — ✅ FATTA (2026-10-26)
 
-- Implementare il `WebSocketHandler` di hudsucker: catturare i messaggi WS
-  (direzione, payload) come parte del flow o come flow dedicato.
-- **Verifica:** una connessione WS mostra i messaggi catturati.
+- `core/proxy/src/websocket.rs`: `WebSocketHandler` **observe-only** — inoltra
+  ogni frame intatto e, per le connessioni in-scope, emette
+  `ProxyEvent::WebSocket(WsMessage)` con direzione, tipo (Text/Binary/Ping/Pong/
+  Close) e payload. Tipi `WsMessage`/`WsDirection`/`WsKind` in `elliot-httpraw`.
+  Lo scope è ri-controllato lato WS (fuori scope = non catturato; il `wss` fuori
+  scope è già tunnelato senza MITM a monte).
+- **Verifica:** unit test in `websocket.rs` (classify di ogni tipo, gating di
+  scope in/out, default di porta per `ws://`).
+- **Follow-up (fuori da questa fase):** editing/intercept dei frame WS,
+  correlazione dei messaggi al flow HTTP di upgrade e separazione di socket
+  concorrenti verso lo stesso host, UI dedicata nella schermata Proxy.
 
 ---
 

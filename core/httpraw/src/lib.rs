@@ -109,6 +109,43 @@ impl HttpVersion {
     }
 }
 
+/// A single WebSocket message observed on an in-scope connection (Phase D).
+///
+/// WebSocket traffic does not fit the request/response [`Flow`] shape, so it is
+/// carried as its own value. The `connection` key groups the two directions of
+/// one socket; it is derived from the client address and the server authority,
+/// so concurrent sockets from the same client to the same host currently share
+/// a key (a known limitation — stitching messages to the originating HTTP
+/// upgrade flow, and separating concurrent sockets, is a follow-up).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WsMessage {
+    pub id: Uuid,
+    pub connection: String,
+    pub at: SystemTime,
+    pub client_addr: SocketAddr,
+    pub scheme: Scheme,
+    pub host: String,
+    pub port: u16,
+    pub direction: WsDirection,
+    pub kind: WsKind,
+    pub payload: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WsDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WsKind {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlowState {
     Pending,
@@ -194,5 +231,15 @@ mod tests {
     fn response_round_trips_to_wire() {
         let raw = serialize_response(200, "OK", HttpVersion::Http11, &[], b"hi");
         assert_eq!(&raw[..], b"HTTP/1.1 200 OK\r\n\r\nhi");
+    }
+
+    #[test]
+    fn http2_version_maps_and_serializes_as_1_1() {
+        // Phase C: an h2 message is tagged H2 in the parsed view, but has no
+        // textual start line, so the reconstructed raw view falls back to 1.1.
+        assert_eq!(HttpVersion::from_http(http::Version::HTTP_2), HttpVersion::H2);
+        assert_eq!(HttpVersion::H2.wire_token(), "HTTP/1.1");
+        let raw = serialize_request("GET", "/", HttpVersion::H2, &[], b"");
+        assert_eq!(&raw[..], b"GET / HTTP/1.1\r\n\r\n");
     }
 }

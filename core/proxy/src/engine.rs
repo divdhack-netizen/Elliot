@@ -55,6 +55,12 @@ pub async fn start(
 
     let intercept_on = Arc::new(AtomicBool::new(false));
     let registry = Registry::default();
+    // The WebSocket handler shares the event sink and scope decider with the
+    // HTTP handler, so clone before the HTTP handler takes ownership.
+    let ws_handler = crate::websocket::WsHandler {
+        events: events.clone(),
+        scope: scope.clone(),
+    };
     let handler = Handler {
         events,
         scope,
@@ -80,6 +86,7 @@ pub async fn start(
         .with_ca(authority)
         .with_rustls_connector(aws_lc_rs::default_provider())
         .with_http_handler(handler)
+        .with_websocket_handler(ws_handler)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
         })
