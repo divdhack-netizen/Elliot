@@ -1,6 +1,6 @@
 # Elliot — registro di progettazione
 
-Documento di riferimento sulle decisioni prese. Ultimo aggiornamento: 2026-10-18.
+Documento di riferimento sulle decisioni prese. Ultimo aggiornamento: 2026-10-26.
 
 ## Visione
 
@@ -146,7 +146,27 @@ Contratto condiviso fra agente (grounding), runner (validazione) e utente
   invece di `sed` sul proprio sorgente. Verificato: path reale + stub (via env)
   + input malformati/non-oggetto/vuoti + consumatore che molla a metà;
   `py_compile` ok.
-- **Prossimo:** Fase 4 — cablare la slice (Tauri → sidecar → stream → UI).
+- **Fatto (2026-10-26):** Fase 4 — slice agente cablata end-to-end (Tauri →
+  sidecar → stream → UI), insieme allo scaffolding dei comandi lato app.
+- **Fatto (2026-10-26):** modulo **proxy** — crate `elliot-proxy`
+  (`core/proxy/`, ~1560 righe) su `hudsucker` + `rustls` + `rcgen`, con il tipo
+  condiviso `Flow` in `elliot-httpraw`. Rispetto a
+  [`docs/plans/proxy.md`](plans/proxy.md): **Fase A** (cattura passiva + MITM
+  TLS — `engine.rs`, `handler.rs`, `convert.rs`, CA locale in `tls/ca.rs` con
+  export del solo certificato pubblico via `ca_pem()`, guardia open-proxy che
+  rifiuta i bind non-loopback) e **Fase B** (intercept — `intercept.rs`,
+  `set_intercept`/`decide`) implementate; `AllowAll` come decider finché
+  `elliot-scope` non è pronto. Esempio `examples/run.rs` + smoke test
+  `tests/smoke.rs`. **Fase C (HTTP/2 esplicito)** e **Fase D (WebSocket)**
+  ancora da fare (nessun `websocket.rs`).
+- **Fatto (2026-10-26):** UI della schermata **Proxy** — `app/src/proxy/`
+  (`ProxyScreen`, `FlowTable`, `MessageViewer`, `InterceptView`, `CaDialog`,
+  filtri, hook `useProxy`, `backend.ts`) + comando Tauri
+  `app/src-tauri/src/proxy.rs` e `.claude/launch.json` per l'avvio.
+- **Prossimo:** crate `elliot-scope` (il `ScopeDecider` vero al posto di
+  `AllowAll`; fonte di verità unica da cui dipendono proxy/repeater/intruder),
+  poi le Fasi C/D del proxy e gli altri crate stub (`store`, `repeater`,
+  `intruder`, `runner`).
 
 ## Non ancora deciso
 
