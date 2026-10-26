@@ -5,6 +5,12 @@ version.workspace = true
 
 [dependencies]
 elliot-httpraw = { path = "../httpraw" }
+# Shared TLS policy: with `verify_upstream=false` the permissive upstream
+# `ClientConfig` comes from here.
+elliot-tls = { path = "../tls" }
+
+# Only used for the opt-in permissive upstream connector (`verify_upstream=false`).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "webpki-tokio", "logging"] }
 
 # MITM proxy engine (hyper + rustls + rcgen under the hood). Default features
 # already bring rustls-client + rcgen-ca + the decoder; http2 is opt-in.
@@ -24,7 +30,9 @@ thiserror = { workspace = true }
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "net", "io-util"] }
+# A self-signed loopback HTTPS server for the upstream-verification test.
+tokio-rustls = "0.26"
 tempfile = "3"
 
 [lints]

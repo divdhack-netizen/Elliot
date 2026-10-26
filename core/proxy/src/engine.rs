@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use hudsucker::{
-    certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs, Proxy,
+    certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs,
+    tokio_tungstenite::Connector, Proxy,
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -34,17 +35,6 @@ pub async fn start(
     scope: Arc<dyn ScopeDecider>,
     events: mpsc::Sender<ProxyEvent>,
 ) -> Result<EngineHandle> {
-    if !config.verify_upstream {
-        // Accept-invalid upstream verification is a deliberate, logged opt-out.
-        // TODO(separate task): build a custom rustls ClientConfig with a
-        // permissive verifier wired via `with_http_connector`. Until then we
-        // fail safe and keep verifying.
-        tracing::warn!(
-            "verify_upstream=false requested but not yet implemented; keeping upstream \
-             certificate verification ON"
-        );
-    }
-
     let ca = Ca::load_or_create(&config.ca_dir).context("preparing root CA")?;
     let ca_pem = ca.cert_pem().to_string();
     let authority = RcgenAuthority::new(
@@ -81,23 +71,62 @@ pub async fn start(
         tokio::net::TcpListener::from_std(std_listener).context("adopting listener into tokio")?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let proxy = Proxy::builder()
-        .with_listener(listener)
-        .with_ca(authority)
-        .with_rustls_connector(aws_lc_rs::default_provider())
-        .with_http_handler(handler)
-        .with_websocket_handler(ws_handler)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .build()
-        .context("building proxy")?;
+    let shutdown = async move {
+        let _ = shutdown_rx.await;
+    };
 
-    let join = tokio::spawn(async move {
-        if let Err(e) = proxy.start().await {
-            tracing::error!("proxy server stopped with error: {e}");
-        }
-    });
+    // `with_rustls_connector` hands back an opaque connector type, so the two
+    // arms cannot be unified into one expression. Only the upstream connector
+    // (and with it the verification policy) differs.
+    let join = if config.verify_upstream {
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(authority)
+            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_handler(handler)
+            .with_websocket_handler(ws_handler)
+            .with_graceful_shutdown(shutdown)
+            .build()
+            .context("building proxy")?;
+        tokio::spawn(async move {
+            if let Err(e) = proxy.start().await {
+                tracing::error!("proxy server stopped with error: {e}");
+            }
+        })
+    } else {
+        // Deliberate opt-out: upstream certificates are not verified. Logged
+        // loudly because it silently weakens every MITM'd connection.
+        tracing::warn!(
+            "verify_upstream=false: upstream TLS certificates will NOT be verified"
+        );
+        // One permissive config feeds both the HTTP client connector and the
+        // WebSocket connector, so `wss://` upstream is covered too.
+        let tls_config = Arc::new(
+            elliot_tls::insecure_client_config()
+                .context("building the permissive TLS config")?,
+        );
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config((*tls_config).clone())
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(authority)
+            .with_http_connector(connector)
+            .with_websocket_connector(Connector::Rustls(tls_config))
+            .with_http_handler(handler)
+            .with_websocket_handler(ws_handler)
+            .with_graceful_shutdown(shutdown)
+            .build()
+            .context("building proxy")?;
+        tokio::spawn(async move {
+            if let Err(e) = proxy.start().await {
+                tracing::error!("proxy server stopped with error: {e}");
+            }
+        })
+    };
 
     Ok(EngineHandle {
         intercept_on,
