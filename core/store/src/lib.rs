@@ -5,31 +5,41 @@
 //! credentials, tokens, PII and client data). Handing a project off is copying
 //! one file.
 //!
-//! This crate owns the schema and the [`Flow`] persistence. It is deliberately
-//! synchronous (rusqlite); the app wraps a [`Store`] behind its own lock and
-//! calls it off the UI thread.
+//! This crate owns the schema and the persistence of captured traffic: HTTP
+//! [`Flow`]s and generic (non-HTTP) [`Stream`]/[`Message`] pairs. It is
+//! deliberately synchronous (rusqlite); the app wraps a [`Store`] behind its
+//! own lock and calls it off the UI thread.
 //!
-//! Writes come in two shapes: [`Store::upsert_flow`] for a single flow and
-//! [`Store::upsert_flows`] for a burst in one transaction. Header lists are
+//! Writes come in two shapes: one-at-a-time ([`Store::upsert_flow`],
+//! [`Store::append_message`]) and in a burst, in one transaction
+//! ([`Store::upsert_flows`], [`Store::append_messages`]). Header lists are
 //! stored as a compact length-prefixed binary blob (values are arbitrary
 //! bytes).
 //!
-//! Scope of this first cut: open/create an encrypted file, version the schema,
-//! and upsert / fetch / list [`Flow`]s. Migrations beyond v1, the catalog and
-//! repeater/intruder history, and streaming queries are follow-ups.
+//! # Schema versioning
+//!
+//! `PRAGMA user_version` holds the schema version. Opening a **v1** file (the
+//! first release: HTTP flows only) migrates it in place to **v2** by adding the
+//! `streams` and `messages` tables, so an existing project gains non-HTTP
+//! capture without losing anything.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 use elliot_httpraw::{
-    Flow, FlowState, Header, HttpVersion, Request, Response, Scheme, ScopeDecision,
+    Direction, Flow, FlowState, Header, HttpVersion, Message, Request, Response, Scheme,
+    ScopeDecision, Stream, Transport,
 };
 
 /// Current on-disk schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v1: HTTP flows + settings. v2: captured non-HTTP streams and their messages.
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -72,17 +82,23 @@ impl Store {
 
     /// Open an existing encrypted project file. Returns an error if the
     /// passphrase is wrong (the first query fails to decrypt) or the schema
-    /// version is not understood by this build.
+    /// version is newer than this build understands.
     pub fn open(path: impl AsRef<Path>, passphrase: &str) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", passphrase)?;
         // The first real read decrypts a page; a wrong key fails right here.
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != SCHEMA_VERSION {
-            return Err(StoreError::SchemaVersion {
-                found: version,
-                supported: SCHEMA_VERSION,
-            });
+        match version {
+            v if v == SCHEMA_VERSION => {}
+            // Upgrade in place: an existing project must keep opening, and
+            // gaining non-HTTP capture must not require re-importing anything.
+            1 => migrate_v1_to_v2(&conn)?,
+            other => {
+                return Err(StoreError::SchemaVersion {
+                    found: other,
+                    supported: SCHEMA_VERSION,
+                })
+            }
         }
         // Idempotent, so a file written before a table existed still gains it.
         init_schema(&conn)?;
@@ -119,6 +135,78 @@ impl Store {
     /// Insert or replace a flow.
     pub fn upsert_flow(&self, flow: &Flow) -> Result<(), StoreError> {
         upsert_on(&self.conn, flow)
+    }
+
+    /// Insert or replace a captured non-HTTP stream.
+    pub fn upsert_stream(&self, stream: &Stream) -> Result<(), StoreError> {
+        self.conn.execute(UPSERT_STREAM_SQL, stream_params(stream))?;
+        Ok(())
+    }
+
+    /// Append one observed message (a TCP chunk or a UDP datagram).
+    pub fn append_message(&self, message: &Message) -> Result<(), StoreError> {
+        self.conn.execute(APPEND_MESSAGE_SQL, message_params(message))?;
+        Ok(())
+    }
+
+    /// Append many messages in **one** transaction: the capture path produces
+    /// them in bursts, and a transaction per message costs an fsync each.
+    pub fn append_messages(&mut self, messages: &[Message]) -> Result<(), StoreError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for message in messages {
+            tx.execute(APPEND_MESSAGE_SQL, message_params(message))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fetch one stream by id.
+    pub fn get_stream(&self, id: Uuid) -> Result<Option<Stream>, StoreError> {
+        self.conn
+            .query_row(
+                &format!("SELECT {STREAM_COLUMNS} FROM streams WHERE id = ?1"),
+                [id.to_string()],
+                row_to_stream,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// List streams, most recent first, up to `limit`.
+    pub fn list_streams(&self, limit: usize) -> Result<Vec<Stream>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams ORDER BY started_at DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit as i64], row_to_stream)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// Every message of one stream, in sequence order.
+    pub fn messages_for(&self, stream_id: Uuid) -> Result<Vec<Message>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stream_id, seq, at, direction, data FROM messages \
+             WHERE stream_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([stream_id.to_string()], row_to_message)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Number of stored streams.
+    pub fn count_streams(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM streams", [], |r| r.get(0))?)
     }
 
     /// Insert or replace many flows in **one** transaction.
@@ -175,7 +263,26 @@ impl Store {
 /// fresh file and on one written by an earlier build.
 fn init_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(
-        r#"
+        &format!("{FLOWS_AND_SETTINGS_DDL}{STREAMS_AND_MESSAGES_DDL}"),
+    )?;
+    Ok(())
+}
+
+/// Upgrade a v1 file (HTTP flows only) to v2 by adding the non-HTTP tables.
+///
+/// Runs in one transaction, so a failure leaves the file at v1 rather than at a
+/// half-migrated version. Every statement is `IF NOT EXISTS`, so re-running the
+/// migration against a file that already has the tables is harmless.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(STREAMS_AND_MESSAGES_DDL)?;
+    tx.pragma_update(None, "user_version", 2)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The v1 tables: HTTP flows plus key/value settings.
+const FLOWS_AND_SETTINGS_DDL: &str = r#"
         CREATE TABLE IF NOT EXISTS flows (
             id            TEXT PRIMARY KEY,
             started_at    INTEGER NOT NULL,
@@ -206,10 +313,41 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             key   TEXT PRIMARY KEY,
             value BLOB NOT NULL
         );
-        "#,
-    )?;
-    Ok(())
-}
+"#;
+
+/// The v2 tables: captured non-HTTP streams and their messages.
+///
+/// The foreign key is declared for documentation and for tools that inspect the
+/// file; SQLite does not enforce it unless `PRAGMA foreign_keys` is on, which is
+/// deliberate — capture events are written as they arrive, and a message must
+/// never be dropped because its stream row has not been flushed yet.
+const STREAMS_AND_MESSAGES_DDL: &str = r#"
+        CREATE TABLE IF NOT EXISTS streams (
+            id            TEXT PRIMARY KEY,
+            started_at    INTEGER NOT NULL,
+            completed_at  INTEGER,
+            client_addr   TEXT NOT NULL,
+            transport     TEXT NOT NULL,
+            host          TEXT NOT NULL,
+            port          INTEGER NOT NULL,
+            tls           INTEGER NOT NULL,
+            scope         TEXT NOT NULL,
+            state         TEXT NOT NULL,
+            error         TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_streams_started ON streams (started_at);
+        CREATE INDEX IF NOT EXISTS idx_streams_host ON streams (host);
+        CREATE TABLE IF NOT EXISTS messages (
+            id         TEXT PRIMARY KEY,
+            stream_id  TEXT NOT NULL,
+            seq        INTEGER NOT NULL,
+            at         INTEGER NOT NULL,
+            direction  TEXT NOT NULL,
+            data       BLOB NOT NULL,
+            FOREIGN KEY (stream_id) REFERENCES streams (id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_stream ON messages (stream_id, seq);
+"#;
 
 const COLUMNS: &str = "id, started_at, completed_at, client_addr, scheme, host, port, \
      method, target, req_version, req_headers, req_body, req_raw, \
@@ -277,6 +415,102 @@ fn upsert_on(conn: &Connection, flow: &Flow) -> Result<(), StoreError> {
         ],
     )?;
     Ok(())
+}
+
+const STREAM_COLUMNS: &str = "id, started_at, completed_at, client_addr, transport, host, \
+     port, tls, scope, state, error";
+
+const UPSERT_STREAM_SQL: &str = r#"
+    INSERT OR REPLACE INTO streams (
+        id, started_at, completed_at, client_addr, transport, host,
+        port, tls, scope, state, error
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+"#;
+
+const APPEND_MESSAGE_SQL: &str = r#"
+    INSERT OR REPLACE INTO messages (id, stream_id, seq, at, direction, data)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+"#;
+
+fn stream_params(stream: &Stream) -> impl rusqlite::Params {
+    (
+        stream.id.to_string(),
+        millis(stream.started_at),
+        stream.completed_at.map(millis),
+        stream.client_addr.to_string(),
+        stream.transport.as_token(),
+        stream.host.clone(),
+        i64::from(stream.port),
+        i64::from(stream.tls),
+        stream.scope.as_token(),
+        stream.state.as_token(),
+        stream.error.clone(),
+    )
+}
+
+fn message_params(message: &Message) -> impl rusqlite::Params {
+    (
+        message.id.to_string(),
+        message.stream_id.to_string(),
+        message.seq as i64,
+        millis(message.at),
+        message.direction.as_token(),
+        message.data.to_vec(),
+    )
+}
+
+fn row_to_stream(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Stream, StoreError>> {
+    Ok(build_stream(row))
+}
+
+fn build_stream(row: &rusqlite::Row<'_>) -> Result<Stream, StoreError> {
+    let id: String = row.get(0)?;
+    let started_at: i64 = row.get(1)?;
+    let completed_at: Option<i64> = row.get(2)?;
+    let client_addr: String = row.get(3)?;
+    let transport: String = row.get(4)?;
+    let host: String = row.get(5)?;
+    let port: i64 = row.get(6)?;
+    let tls: i64 = row.get(7)?;
+    let scope: String = row.get(8)?;
+    let state: String = row.get(9)?;
+    let error: Option<String> = row.get(10)?;
+
+    Ok(Stream {
+        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+        started_at: from_millis(started_at),
+        completed_at: completed_at.map(from_millis),
+        // A malformed address cannot happen for rows this build wrote; degrade
+        // to a placeholder rather than failing the whole listing.
+        client_addr: client_addr
+            .parse::<SocketAddr>()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
+        transport: Transport::from_token(&transport),
+        host,
+        port: port as u16,
+        tls: tls != 0,
+        scope: ScopeDecision::from_token(&scope),
+        state: FlowState::from_token(&state),
+        error,
+    })
+}
+
+fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    let id: String = row.get(0)?;
+    let stream_id: String = row.get(1)?;
+    let seq: i64 = row.get(2)?;
+    let at: i64 = row.get(3)?;
+    let direction: String = row.get(4)?;
+    let data: Vec<u8> = row.get(5)?;
+
+    Ok(Message {
+        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+        stream_id: Uuid::parse_str(&stream_id).unwrap_or_else(|_| Uuid::nil()),
+        seq: seq.max(0) as u64,
+        at: from_millis(at),
+        direction: Direction::from_token(&direction),
+        data: Bytes::from(data),
+    })
 }
 
 /// Map a row (selected as `COLUMNS`) back into a [`Flow`]. The inner result
@@ -649,6 +883,173 @@ mod tests {
 
         let got = store.get_flow(flow.id).unwrap().expect("flow present");
         assert_eq!(got.request.headers, flow.request.headers);
+    }
+
+    fn sample_stream() -> Stream {
+        Stream {
+            id: Uuid::new_v4(),
+            started_at: UNIX_EPOCH + Duration::from_millis(1_700_000_100_000),
+            completed_at: None,
+            client_addr: "127.0.0.1:51000".parse().unwrap(),
+            transport: Transport::Tcp,
+            host: "redis.internal".into(),
+            port: 6379,
+            tls: false,
+            scope: ScopeDecision::InScope,
+            state: FlowState::Pending,
+            error: None,
+        }
+    }
+
+    fn sample_message(stream_id: Uuid, seq: u64, direction: Direction, data: &[u8]) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            stream_id,
+            seq,
+            at: UNIX_EPOCH + Duration::from_millis(1_700_000_100_000 + seq),
+            direction,
+            data: Bytes::copy_from_slice(data),
+        }
+    }
+
+    #[test]
+    fn streams_and_messages_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+
+        let mut stream = sample_stream();
+        store.upsert_stream(&stream).unwrap();
+
+        // Binary payloads, both directions, and a completed state written back.
+        let c2s = sample_message(stream.id, 0, Direction::ClientToServer, b"PING\r\n");
+        let s2c = sample_message(stream.id, 1, Direction::ServerToClient, &[0x00, 0xFF, 0x0A]);
+        store.append_messages(&[c2s.clone(), s2c.clone()]).unwrap();
+
+        stream.completed_at = Some(UNIX_EPOCH + Duration::from_millis(1_700_000_200_000));
+        stream.state = FlowState::Completed;
+        store.upsert_stream(&stream).unwrap();
+
+        let got = store.get_stream(stream.id).unwrap().expect("stream present");
+        assert_eq!(got.host, "redis.internal");
+        assert_eq!(got.port, 6379);
+        assert_eq!(got.transport, Transport::Tcp);
+        assert!(!got.tls);
+        assert_eq!(got.state, FlowState::Completed);
+        assert_eq!(got.client_addr, "127.0.0.1:51000".parse().unwrap());
+        assert_eq!(got.completed_at, stream.completed_at);
+
+        let messages = store.messages_for(stream.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].seq, 0);
+        assert_eq!(messages[0].direction, Direction::ClientToServer);
+        assert_eq!(&messages[0].data[..], b"PING\r\n");
+        assert_eq!(messages[1].direction, Direction::ServerToClient);
+        assert_eq!(&messages[1].data[..], &[0x00, 0xFF, 0x0A]);
+
+        assert_eq!(store.count_streams().unwrap(), 1);
+        assert_eq!(store.list_streams(10).unwrap().len(), 1);
+        // A stream from another association is not mixed in.
+        assert!(store.messages_for(Uuid::new_v4()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn udp_streams_and_ordering_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.elliot");
+        let stream_id = {
+            let mut store = Store::create(&path, "pw").unwrap();
+            let stream = Stream {
+                transport: Transport::Udp,
+                tls: false,
+                ..sample_stream()
+            };
+            store.upsert_stream(&stream).unwrap();
+            // Appended out of order on purpose: reading must sort by seq.
+            store
+                .append_messages(&[
+                    sample_message(stream.id, 2, Direction::ServerToClient, b"third"),
+                    sample_message(stream.id, 0, Direction::ClientToServer, b"first"),
+                    sample_message(stream.id, 1, Direction::ClientToServer, b"second"),
+                ])
+                .unwrap();
+            stream.id
+        };
+
+        let store = Store::open(&path, "pw").unwrap();
+        let got = store.get_stream(stream_id).unwrap().expect("stream present");
+        assert_eq!(got.transport, Transport::Udp);
+        let messages = store.messages_for(stream_id).unwrap();
+        let seqs: Vec<u64> = messages.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2], "messages come back in sequence order");
+        assert_eq!(&messages[2].data[..], b"third");
+    }
+
+    /// A file written by the first release (HTTP flows only, `user_version` 1)
+    /// must open and gain the new tables **without losing anything**.
+    #[test]
+    fn a_v1_file_is_migrated_to_v2_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.elliot");
+
+        let flow_id = {
+            let store = Store::create(&path, "pw").unwrap();
+            let flow = sample_flow();
+            store.upsert_flow(&flow).unwrap();
+            store.set_setting("scope_policy", b"kept").unwrap();
+
+            // Stand in for a v1 file: no streams/messages tables and the old
+            // version stamp.
+            store
+                .conn
+                .execute_batch("DROP TABLE messages; DROP TABLE streams;")
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 1).unwrap();
+            flow.id
+        };
+
+        let store = Store::open(&path, "pw").unwrap();
+
+        // Migrated, and the new tables are usable straight away.
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let stream = sample_stream();
+        store.upsert_stream(&stream).unwrap();
+        store
+            .append_message(&sample_message(stream.id, 0, Direction::ClientToServer, b"hi"))
+            .unwrap();
+
+        // Old data survived.
+        assert!(store.get_flow(flow_id).unwrap().is_some());
+        assert_eq!(store.get_setting("scope_policy").unwrap().unwrap(), b"kept".to_vec());
+        assert_eq!(store.count_flows().unwrap(), 1);
+    }
+
+    #[test]
+    fn opening_a_newer_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.elliot");
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store
+                .conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = Store::open(&path, "pw")
+            .err()
+            .expect("a newer schema must not be opened");
+        assert!(matches!(err, StoreError::SchemaVersion { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn appending_an_empty_batch_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+        store.append_messages(&[]).unwrap();
+        assert_eq!(store.count_streams().unwrap(), 0);
     }
 
     #[test]

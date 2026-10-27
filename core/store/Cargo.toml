@@ -14,10 +14,11 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = { workspace = true }
+# Message payloads are bytes, not text.
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"
-bytes = "1"
 
 [lints]
 workspace = true
