@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,7 +42,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Name of the packaged sidecar binary (see `tauri.conf.json` `externalBin`).
 const SIDECAR_BIN: &str = "elliot-agent";
 /// Protocol version the bridge speaks. Mirrors `PROTOCOL_VERSION` in the sidecar.
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
+/// Conversation turns kept in memory (6 exchanges). The oldest pairs are
+/// dropped first, so a truncated history still starts with a user turn.
+const HISTORY_TURNS: usize = 12;
+/// Total characters kept across those turns; a big pasted banner must not push
+/// the prompt over the model's window.
+const HISTORY_CHARS: usize = 6_000;
 
 const EVENT_CHUNK: &str = "agent://chunk";
 const EVENT_DONE: &str = "agent://done";
@@ -49,8 +56,10 @@ const EVENT_ERROR: &str = "agent://error";
 const EVENT_PROPOSAL: &str = "agent://proposal";
 const EVENT_EXECUTION: &str = "agent://execution";
 const EVENT_EXIT: &str = "agent://exit";
+const EVENT_RESET: &str = "agent://reset";
 
-/// State held by Tauri: the sidecar process and the proposals it produced.
+/// State held by Tauri: the sidecar process, the proposals it produced and the
+/// conversation memory shared with the reader task.
 #[derive(Default)]
 pub struct AgentState {
     /// Lazily started on the first message; killed on stop or app exit.
@@ -58,6 +67,83 @@ pub struct AgentState {
     /// Proposals waiting for (or already past) the human decision. Shared with
     /// the reader task, which registers them as frames arrive.
     proposals: Arc<Mutex<HashMap<Uuid, Proposal>>>,
+    /// Conversation memory. Shared with the reader task, which appends the
+    /// assistant turn when the response completes.
+    session: Arc<Session>,
+    /// Project the memory belongs to: opening another one resets it.
+    last_project: Mutex<Option<PathBuf>>,
+}
+
+/// One remembered exchange turn. Plain text: the sidecar turns it into an
+/// Ollama message; nothing here is executed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatTurn {
+    pub role: String,
+    pub text: String,
+}
+
+/// Conversation memory and the in-flight request flag.
+///
+/// The protocol is serial — one request in, one response out — so a second
+/// request while one is streaming would interleave chunks into `last_reply` and
+/// corrupt the history. `streaming` is the gate that makes that impossible.
+#[derive(Default)]
+pub struct Session {
+    history: Mutex<Vec<ChatTurn>>,
+    /// Text accumulated from the chunks of the request in flight.
+    last_reply: Mutex<String>,
+    streaming: AtomicBool,
+}
+
+impl Session {
+    async fn history(&self) -> Vec<ChatTurn> {
+        self.history.lock().await.clone()
+    }
+
+    async fn push_turn(&self, role: &str, text: String) {
+        let mut history = self.history.lock().await;
+        history.push(ChatTurn {
+            role: role.to_string(),
+            text,
+        });
+        trim_history(&mut history);
+    }
+
+    /// Forget the conversation. Used by `agent_reset` and on a project change.
+    async fn clear(&self) {
+        self.history.lock().await.clear();
+        self.last_reply.lock().await.clear();
+    }
+
+    /// Claim the single in-flight slot, or report that one is already running.
+    fn begin(&self) -> Result<(), String> {
+        self.streaming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| "attendi la risposta corrente".to_string())
+    }
+
+    fn finish(&self) {
+        self.streaming.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Drop the oldest turns until both limits hold. Pairs are dropped together so
+/// the truncation never leaves an assistant answer with no question.
+fn trim_history(history: &mut Vec<ChatTurn>) {
+    while history.len() > HISTORY_TURNS {
+        history.remove(0);
+    }
+    let chars = |h: &[ChatTurn]| h.iter().map(|t| t.text.chars().count()).sum::<usize>();
+    while chars(history) > HISTORY_CHARS && history.len() > 2 {
+        history.drain(..2);
+    }
+}
+
+/// A project change invalidates the conversation: the context items belong to
+/// the old target, and the model must not carry them into the new one.
+fn project_changed(last: &Option<PathBuf>, current: &Option<PathBuf>) -> bool {
+    last != current
 }
 
 struct Sidecar {
@@ -309,6 +395,7 @@ pub async fn pump<R: tokio::io::AsyncRead + Unpin>(
     sink: Arc<dyn Sink>,
     scope: SharedScope,
     proposals: Arc<Mutex<HashMap<Uuid, Proposal>>>,
+    session: Arc<Session>,
 ) {
     let mut lines = BufReader::new(reader).lines();
     loop {
@@ -318,8 +405,22 @@ pub async fn pump<R: tokio::io::AsyncRead + Unpin>(
                     continue;
                 }
                 match parse_frame(&line) {
-                    Ok(Frame::Chunk { text }) => sink.push(EVENT_CHUNK, json!({ "text": text })),
-                    Ok(Frame::Done) => sink.push(EVENT_DONE, json!({})),
+                    Ok(Frame::Chunk { text }) => {
+                        // Accumulate for the history turn, then forward: the UI
+                        // renders the chunk and the memory keeps the whole reply
+                        // without showing it twice.
+                        session.last_reply.lock().await.push_str(&text);
+                        sink.push(EVENT_CHUNK, json!({ "text": text }));
+                    }
+                    Ok(Frame::Done) => {
+                        let reply = std::mem::take(&mut *session.last_reply.lock().await);
+                        // An empty reply is not a turn worth remembering.
+                        if !reply.trim().is_empty() {
+                            session.push_turn("assistant", reply).await;
+                        }
+                        session.finish();
+                        sink.push(EVENT_DONE, json!({}));
+                    }
                     Ok(Frame::Error { message }) => {
                         sink.push(EVENT_ERROR, json!({ "message": message }))
                     }
@@ -347,6 +448,8 @@ pub async fn pump<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
+    // The sidecar is gone: whatever was streaming will never finish.
+    session.finish();
     sink.push(EVENT_EXIT, json!({}));
 }
 
@@ -394,6 +497,7 @@ async fn spawn(
     app: &AppHandle,
     scope: SharedScope,
     proposals: Arc<Mutex<HashMap<Uuid, Proposal>>>,
+    session: Arc<Session>,
 ) -> Result<Sidecar, String> {
     let mut cmd = sidecar_command()?;
     cmd.stdin(Stdio::piped())
@@ -416,7 +520,7 @@ async fn spawn(
     }
 
     let sink: Arc<dyn Sink> = Arc::new(app.clone());
-    tauri::async_runtime::spawn(pump(stdout, sink, scope, proposals));
+    tauri::async_runtime::spawn(pump(stdout, sink, scope, proposals, session));
     Ok(Sidecar { child, stdin })
 }
 
@@ -460,30 +564,82 @@ fn describe_rule(rule: &Rule) -> String {
     format!("{scheme}://{host}{port}{path}")
 }
 
-#[tauri::command]
-pub async fn agent_send(
-    app: AppHandle,
-    state: State<'_, AgentState>,
-    scope: State<'_, SharedScope>,
+/// The JSON request the sidecar receives. Split out so the shape (version,
+/// fields, the context and history lists) is testable without a process.
+fn build_request(prompt: &str, context: Vec<String>, history: &[ChatTurn]) -> Value {
+    json!({
+        "v": PROTOCOL_VERSION,
+        "prompt": prompt,
+        "context": context,
+        "history": history,
+    })
+}
+
+/// Send one prompt through the sidecar, with the conversation memory.
+///
+/// The user turn is queued **before** the write, so a crash mid-request still
+/// leaves the request in the transcript on the next one. The assistant turn is
+/// queued by the reader task on `done`.
+async fn send_request(
+    app: &AppHandle,
+    state: &AgentState,
+    scope: &SharedScope,
     prompt: String,
 ) -> Result<(), String> {
     if prompt.trim().is_empty() {
         return Err("prompt vuoto".into());
     }
+    // A project change invalidates the memory: the old target's material must
+    // not leak into the new one's conversation.
+    let current_project = scope.project_dir().await;
+    {
+        let mut last = state.last_project.lock().await;
+        if project_changed(&last, &current_project) {
+            // The first request after opening a project clears nothing worth
+            // mentioning; a switch between two projects does.
+            let switched = last.is_some();
+            *last = current_project;
+            state.session.clear().await;
+            if switched {
+                let _ = Emitter::emit(
+                    app,
+                    EVENT_RESET,
+                    json!({ "reason": "project" }),
+                );
+            }
+        }
+    }
+
+    state.session.begin()?;
+    *state.session.last_reply.lock().await = String::new();
+
+    // The prompt is sent as its own message; `history` is what came before.
+    let history = state.session.history().await;
+    state.session.push_turn("user", prompt.clone()).await;
+    // Curated context is data for this request only (the sidecar frames it as
+    // untrusted data and puts it in the last user message).
     let context = curated_context(&scope.policy());
+    let request = build_request(&prompt, context, &history);
+    let line = format!("{request}\n");
 
     let mut guard = state.sidecar.lock().await;
     if guard.is_none() {
-        *guard = Some(spawn(&app, scope.inner().clone(), state.proposals.clone()).await?);
+        match spawn(
+            app,
+            scope.clone(),
+            state.proposals.clone(),
+            state.session.clone(),
+        )
+        .await
+        {
+            Ok(sidecar) => *guard = Some(sidecar),
+            Err(e) => {
+                state.session.finish();
+                return Err(e);
+            }
+        }
     }
     let sidecar = guard.as_mut().expect("spawned above");
-    let request = json!({
-        "v": PROTOCOL_VERSION,
-        "prompt": prompt,
-        "context": context,
-    });
-    let line = format!("{request}\n");
-
     let write = async {
         sidecar.stdin.write_all(line.as_bytes()).await?;
         sidecar.stdin.flush().await
@@ -493,14 +649,34 @@ pub async fn agent_send(
     if let Err(e) = write {
         // The child died: drop it, so the next message restarts it.
         *guard = None;
+        state.session.finish();
         return Err(format!("sidecar non raggiungibile: {e}"));
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn agent_send(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    scope: State<'_, SharedScope>,
+    prompt: String,
+) -> Result<(), String> {
+    send_request(&app, &state, scope.inner(), prompt).await
+}
+
+/// Forget the conversation (the UI clears its transcript alongside this).
+#[tauri::command]
+pub async fn agent_reset(state: State<'_, AgentState>) -> Result<(), String> {
+    state.session.clear().await;
+    state.session.finish();
     Ok(())
 }
 
 /// Stop the sidecar. The state also kills it on drop (app exit).
 #[tauri::command]
 pub async fn agent_stop(state: State<'_, AgentState>) -> Result<(), String> {
+    state.session.finish();
     if let Some(mut sidecar) = state.sidecar.lock().await.take() {
         let _ = sidecar.child.kill().await;
     }
@@ -680,6 +856,91 @@ mod tests {
         assert!(curated_context(&ScopePolicy::default())[0].contains("nessuna regola"));
     }
 
+    #[tokio::test]
+    async fn the_history_keeps_at_most_twelve_turns() {
+        let session = Session::default();
+        for i in 0..15 {
+            session.push_turn("user", format!("q{i}")).await;
+            session.push_turn("assistant", format!("a{i}")).await;
+        }
+        let history = session.history().await;
+        assert_eq!(history.len(), HISTORY_TURNS);
+        // The oldest pairs are the ones dropped.
+        assert_eq!(history[0].text, "q9");
+        assert_eq!(history.last().unwrap().text, "a14");
+    }
+
+    #[tokio::test]
+    async fn a_huge_history_is_truncated_by_characters_in_pairs() {
+        let session = Session::default();
+        for i in 0..4 {
+            session.push_turn("user", "x".repeat(3_000)).await;
+            session.push_turn("assistant", format!("a{i}")).await;
+        }
+        let history = session.history().await;
+        let total: usize = history.iter().map(|t| t.text.chars().count()).sum();
+        assert!(
+            total <= HISTORY_CHARS,
+            "the history must fit the character budget, got {total}"
+        );
+        assert_eq!(history[0].role, "user", "truncation drops whole pairs");
+    }
+
+    #[test]
+    fn a_project_change_resets_the_memory() {
+        let a = Some(PathBuf::from("/projects/a"));
+        assert!(!project_changed(&None, &None));
+        assert!(project_changed(&None, &a));
+        assert!(project_changed(&a, &Some(PathBuf::from("/projects/b"))));
+        assert!(!project_changed(&a, &Some(PathBuf::from("/projects/a"))));
+    }
+
+    #[test]
+    fn the_request_carries_the_protocol_version_and_history() {
+        let history = vec![ChatTurn {
+            role: "user".into(),
+            text: "prima".into(),
+        }];
+        let request = build_request(
+            "seconda",
+            vec!["Scope include: example.com".into()],
+            &history,
+        );
+        assert_eq!(request["v"], PROTOCOL_VERSION);
+        assert_eq!(request["v"], 2);
+        assert_eq!(request["prompt"], "seconda");
+        assert_eq!(request["history"][0]["role"], "user");
+        assert_eq!(request["history"][0]["text"], "prima");
+    }
+
+    /// The reader task is what turns a reply into a remembered turn; exercise it
+    /// with frames on a byte reader, no process.
+    #[tokio::test]
+    async fn the_pump_remembers_the_reply_and_releases_the_streaming_slot() {
+        let session = Arc::new(Session::default());
+        session.begin().expect("the slot starts free");
+        let frames = "{\"type\":\"chunk\",\"text\":\"ciao \"}\n\
+                      {\"type\":\"chunk\",\"text\":\"mondo\"}\n\
+                      {\"type\":\"done\"}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Arc::new(ScopeState::new(dir.path().join("project.elliot")));
+        let sink = Arc::new(CollectSink::default());
+        pump(
+            frames.as_bytes(),
+            sink,
+            scope,
+            Arc::new(Mutex::new(HashMap::new())),
+            session.clone(),
+        )
+        .await;
+
+        let history = session.history().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[0].text, "ciao mondo");
+        assert!(session.begin().is_ok(), "the serial gate must be free again");
+    }
+
     #[derive(Default)]
     struct CollectSink {
         events: std::sync::Mutex<Vec<(String, Value)>>,
@@ -761,7 +1022,14 @@ for frame in frames:
 
         let sink = Arc::new(CollectSink::default());
         let proposals = Arc::new(Mutex::new(HashMap::new()));
-        pump(stdout, sink.clone(), scope, proposals.clone()).await;
+        pump(
+            stdout,
+            sink.clone(),
+            scope,
+            proposals.clone(),
+            Arc::new(Session::default()),
+        )
+        .await;
 
         assert_eq!(
             sink.names(),
@@ -802,7 +1070,7 @@ for frame in frames:
         let mut child = cmd.spawn().expect("the sidecar should start");
         let mut stdin = child.stdin.take().unwrap();
         stdin
-            .write_all(b"{\"v\":1,\"prompt\":\"ciao\"}\n")
+            .write_all(b"{\"v\":2,\"prompt\":\"ciao\"}\n")
             .await
             .unwrap();
         stdin.flush().await.unwrap();
@@ -819,6 +1087,7 @@ for frame in frames:
             sink.clone(),
             scope,
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Session::default()),
         )
         .await;
 

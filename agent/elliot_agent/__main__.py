@@ -6,20 +6,26 @@ finché stdin non si chiude, così la chat non paga l'avvio a ogni messaggio.
 Frame in uscita (tutti con ``v`` = versione del protocollo, contratto con il
 ponte Rust in ``app/src-tauri/src/agent.rs``):
 
-  {"v":1,"type":"chunk","text":...}      testo in streaming
-  {"v":1,"type":"proposal",...}          proposta strutturata (opzionale)
-  {"v":1,"type":"error","message":...}   richiesta non valida / errore interno
-  {"v":1,"type":"done"}                  fine risposta (sempre l'ultimo frame)
+  {"v":2,"type":"chunk","text":...}      testo in streaming
+  {"v":2,"type":"proposal",...}          proposta strutturata (opzionale)
+  {"v":2,"type":"error","message":...}   richiesta non valida / errore interno
+  {"v":2,"type":"done"}                  fine risposta (sempre l'ultimo frame)
 
-Frame in ingresso:
+Frame in ingresso (protocollo v2; il sidecar accetta anche v1 senza i campi
+nuovi, che cadono sui default):
 
-  {"v":1,"prompt":..., "model"?:..., "context"?: [string, ...]}
+  {"v":2,"prompt":..., "model"?:..., "context"?: [string, ...],
+   "history"?: [{"role":"user"|"assistant","text":...}, ...]}
 
-``context`` è **dato** (banner, header, righe di scope) passato dal Rust, mai
-istruzioni: viene incorniciato come tale nei prompt. L'agente non esegue nulla e
-non conosce lo scope; emette solo proposte che il core Rust rivalida.
+``history`` è la memoria della conversazione (turni in ordine cronologico),
+limitata e azzerata dal Rust: qui arriva già pronta, il sidecar non la ricorda
+tra una richiesta e l'altra. ``context`` è **dato** (banner, header, righe di
+scope) passato dal Rust, mai istruzioni: viene incorniciato come tale
+nell'**ultimo** messaggio utente, non ripetuto nei turni precedenti.
 
-stdout è esclusivamente per questi frame; ogni diagnostica va su stderr.
+L'agente non esegue nulla e non conosce lo scope; emette solo proposte che il
+core Rust rivalida. stdout è esclusivamente per questi frame; ogni diagnostica
+va su stderr.
 """
 import json
 import os
@@ -34,9 +40,9 @@ from .catalog import (
     parse_proposal_json,
     validate_proposal,
 )
-from .ollama_client import stream_reply
+from .ollama_client import stream_chat
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Il modello piccolo va tenuto sul compito: una proposta, un oggetto JSON, niente
 # prosa. Le regole ripetono i vincoli del catalogo perché il modello non li
@@ -107,9 +113,15 @@ def _handle(request: dict, tools: dict[str, Tool], grounding: str) -> None:
     model = request.get("model") if isinstance(request.get("model"), str) else None
     context = _context_lines(request.get("context"))
 
+    # Lo storico arriva già composto dal Rust; il contesto curato va solo
+    # nell'ultimo turno utente, altrimenti i dati di un target si accumulano in
+    # ogni turno e il modello li tratta come parte della conversazione.
+    history = _history(request.get("history"))
+    user_message = {"role": "user", "content": _chat_prompt(prompt, context)}
+
     try:
         reply_parts: list[str] = []
-        for piece in stream_reply(_chat_prompt(prompt, context), model):
+        for piece in stream_chat([*history, user_message], model):
             reply_parts.append(piece)
             _emit({"type": "chunk", "text": piece})
 
@@ -147,7 +159,7 @@ def propose(
         # scegliere i flag senza dover ripetere il ragionamento.
         ask += f"\nRISPOSTA GIÀ DATA:\n{reply}\n"
 
-    text = "".join(stream_reply(ask, model))
+    text = "".join(stream_chat([{"role": "user", "content": ask}], model))
     candidate = parse_proposal_json(text)
     if candidate is None or candidate.get("tool_id") in (None, ""):
         return None
@@ -182,6 +194,25 @@ def _context_lines(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, str)]
+
+
+def _history(raw: object) -> list[dict]:
+    """Turni validi dello storico, nella forma ``messages`` di Ollama.
+
+    Un turno malformato viene saltato: lo storico è memoria di comodo, non deve
+    poter fermare la chat.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for turn in raw:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        text = turn.get("text")
+        if role in ("user", "assistant") and isinstance(text, str) and text.strip():
+            out.append({"role": role, "content": text})
+    return out
 
 
 def _parse_request(raw: str) -> dict | None:

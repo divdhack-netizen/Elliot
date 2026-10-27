@@ -20,8 +20,12 @@ STUB_PREFIX = "[stub] Ollama non raggiungibile. Eco:"
 OLLAMA_URL_ENV = "ELLIOT_OLLAMA_URL"
 
 
-def stream_reply(prompt: str, model: str | None = None) -> Iterator[str]:
-    """Produce i pezzi di testo della risposta di Ollama.
+def stream_chat(messages: list[dict], model: str | None = None) -> Iterator[str]:
+    """Produce i pezzi di testo della risposta di Ollama a una conversazione.
+
+    ``messages`` è già nella forma di Ollama (``role``/``content``): il sidecar
+    compone storico + messaggio corrente, questo client non conosce il protocollo
+    di Elliot.
 
     Se Ollama è irraggiungibile *prima* di produrre output, degrada a uno stub
     (degrado controllato). Un errore a metà stream interrompe in modo pulito,
@@ -29,7 +33,7 @@ def stream_reply(prompt: str, model: str | None = None) -> Iterator[str]:
     """
     payload = {
         "model": model or DEFAULT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": True,
     }
     produced = False
@@ -53,7 +57,21 @@ def stream_reply(prompt: str, model: str | None = None) -> Iterator[str]:
             _log(f"ollama: stream interrotto dopo output parziale: {exc!r}")
             return
         _log(f"ollama: irraggiungibile, uso lo stub: {exc!r}")
-        yield from _stub_reply(prompt)
+        yield from _stub_reply(_last_user(messages))
+
+
+def stream_reply(prompt: str, model: str | None = None) -> Iterator[str]:
+    """Comodità per una singola richiesta senza storico (wrapper di stream_chat)."""
+    yield from stream_chat([{"role": "user", "content": prompt}], model)
+
+
+def _last_user(messages: list[dict]) -> str:
+    """L'ultimo messaggio utente: lo stub rimanda indietro la richiesta, non
+    tutto lo storico trascinato con sé."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content", ""))
+    return ""
 
 
 def _parse(line: str) -> dict | None:

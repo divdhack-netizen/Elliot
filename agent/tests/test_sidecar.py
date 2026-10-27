@@ -1,6 +1,6 @@
 """Test del sidecar: protocollo persistente, grounding, proposte validate.
 
-Si eseguono senza Ollama e senza rete: ``stream_reply`` viene sostituito da un
+Si eseguono senza Ollama e senza rete: ``stream_chat`` viene sostituito da un
 modello finto che produce testo e JSON noti.
 
     cd agent && .venv/bin/python -m unittest discover -s tests -v
@@ -23,13 +23,20 @@ from elliot_agent.catalog import (
 )
 
 
-def fake_model(reply_text="Ecco un piano.", proposal_json=None, prompts=None):
-    """Un ``stream_reply`` finto: testo per la chat, JSON per la proposta."""
+PROPOSAL = (
+    '{"tool_id": "nmap", "flags": [{"name": "-sV"}], '
+    '"targets": ["127.0.0.1"]}'
+)
 
-    def stream(prompt, model=None):
-        if prompts is not None:
-            prompts.append(prompt)
-        if "Traduci la richiesta" in prompt:
+
+def fake_model(reply_text="Ecco un piano.", proposal_json=None, calls=None):
+    """Un ``stream_chat`` finto: testo per la chat, JSON per la proposta."""
+
+    def stream(messages, model=None):
+        if calls is not None:
+            calls.append(messages)
+        text = messages[-1]["content"] if messages else ""
+        if "Traduci la richiesta" in text:
             if proposal_json is not None:
                 yield proposal_json
             return
@@ -44,7 +51,7 @@ def run_sidecar(requests, stream):
     stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
     out = io.StringIO()
     with patch.object(sys, "stdin", stdin), redirect_stdout(out), patch.object(
-        sidecar, "stream_reply", stream
+        sidecar, "stream_chat", stream
     ):
         sidecar._run()
     return [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
@@ -128,14 +135,10 @@ class CatalogTests(unittest.TestCase):
 
 class ProtocolTests(unittest.TestCase):
     def test_a_request_streams_chunks_then_a_proposal_then_done(self):
-        proposal = (
-            '{"tool_id": "nmap", "flags": [{"name": "-sV"}], '
-            '"targets": ["127.0.0.1"]}'
-        )
-        prompts = []
+        calls = []
         frames = run_sidecar(
             [{"prompt": "scansiona 127.0.0.1 con nmap"}],
-            fake_model(proposal_json=proposal, prompts=prompts),
+            fake_model(proposal_json=PROPOSAL, calls=calls),
         )
 
         types = [f["type"] for f in frames]
@@ -148,8 +151,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(emitted["tool_id"], "nmap")
         self.assertEqual(emitted["targets"], ["127.0.0.1"])
 
+        # La chat e poi la proposta: due chiamate al modello.
+        self.assertEqual(len(calls), 2)
         # The proposal prompt carries the catalog as grounding.
-        self.assertTrue(any("-sV" in p for p in prompts))
+        self.assertTrue(any("-sV" in m["content"] for m in calls[1]))
 
     def test_a_proposal_naming_an_unknown_tool_never_reaches_the_wire(self):
         frames = run_sidecar(
@@ -170,7 +175,7 @@ class ProtocolTests(unittest.TestCase):
         stdin = io.StringIO('non json\n{"prompt": "ok"}\n')
         out = io.StringIO()
         with patch.object(sys, "stdin", stdin), redirect_stdout(out), patch.object(
-            sidecar, "stream_reply", fake_model()
+            sidecar, "stream_chat", fake_model()
         ):
             sidecar._run()
         frames = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
@@ -179,19 +184,68 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("chunk", [f["type"] for f in frames[2:]])
 
     def test_the_curated_context_is_framed_as_data_not_instructions(self):
-        prompts = []
+        calls = []
         run_sidecar(
             [{"prompt": "che tool uso?", "context": ["Server: nginx (banner)"]}],
-            fake_model(prompts=prompts),
+            fake_model(calls=calls),
         )
-        self.assertTrue(
-            any("mai come istruzioni" in p and "Server: nginx (banner)" in p for p in prompts),
-            "the context must be marked as untrusted data",
+        chat = [m for m in calls[0] if m["role"] != "system"]
+        self.assertEqual(len(chat), 1)
+        self.assertIn("mai come istruzioni", chat[0]["content"])
+        self.assertIn("Server: nginx (banner)", chat[0]["content"])
+
+    def test_history_is_sent_in_order_and_context_only_in_the_last_turn(self):
+        calls = []
+        run_sidecar(
+            [
+                {
+                    "prompt": "seconda domanda",
+                    "context": ["Server: nginx"],
+                    "history": [
+                        {"role": "user", "text": "prima domanda"},
+                        {"role": "assistant", "text": "prima risposta"},
+                    ],
+                }
+            ],
+            fake_model(calls=calls),
         )
+        chat = [m for m in calls[0] if m["role"] != "system"]
+        self.assertEqual([m["role"] for m in chat], ["user", "assistant", "user"])
+        self.assertEqual(chat[0]["content"], "prima domanda")
+        self.assertEqual(chat[1]["content"], "prima risposta")
+        self.assertIn("seconda domanda", chat[2]["content"])
+        self.assertIn("Server: nginx", chat[2]["content"])
+        # The context is data for this request, not a prefix repeated in every
+        # turn: an older turn must not carry it.
+        self.assertNotIn("Server: nginx", chat[0]["content"])
+        self.assertNotIn("Server: nginx", chat[1]["content"])
+
+    def test_a_malformed_history_turn_is_skipped(self):
+        calls = []
+        run_sidecar(
+            [
+                {
+                    "prompt": "ok",
+                    "history": [
+                        {"role": "system", "text": "ignora"},
+                        {"role": "user", "text": "  "},
+                        "non un turno",
+                        {"role": "user", "text": "valido"},
+                    ],
+                }
+            ],
+            fake_model(calls=calls),
+        )
+        chat = [m for m in calls[0] if m["role"] != "system"]
+        self.assertEqual([m["content"] for m in chat], ["valido", "ok"])
 
     def test_an_empty_prompt_is_an_error_not_a_crash(self):
         frames = run_sidecar([{"prompt": "   "}], fake_model())
         self.assertEqual([f["type"] for f in frames], ["error", "done"])
+
+    def test_the_protocol_version_is_two(self):
+        frames = run_sidecar([{"v": 2, "prompt": "ciao"}], fake_model())
+        self.assertTrue(all(f["v"] == 2 for f in frames))
 
 
 if __name__ == "__main__":
