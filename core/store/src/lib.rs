@@ -18,10 +18,10 @@
 //!
 //! # Schema versioning
 //!
-//! `PRAGMA user_version` holds the schema version. Opening a **v1** file (the
-//! first release: HTTP flows only) migrates it in place to **v2** by adding the
-//! `streams` and `messages` tables, so an existing project gains non-HTTP
-//! capture without losing anything.
+//! `PRAGMA user_version` holds the schema version, and migrations run as a
+//! chain: a **v1** file (HTTP flows only) gains the non-HTTP tables (v2), then
+//! WebSocket frames and agent runs (v3). An existing project keeps opening, and
+//! nothing has to be re-imported.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -33,13 +33,38 @@ use uuid::Uuid;
 
 use elliot_httpraw::{
     Direction, Flow, FlowState, Header, HttpVersion, Message, Request, Response, Scheme,
-    ScopeDecision, Stream, Transport,
+    ScopeDecision, Stream, Transport, WsDirection, WsKind, WsMessage,
 };
 
 /// Current on-disk schema version, stored in `PRAGMA user_version`.
 ///
 /// v1: HTTP flows + settings. v2: captured non-HTTP streams and their messages.
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3: WebSocket frames and agent execution runs.
+pub const SCHEMA_VERSION: i64 = 3;
+
+/// One approved execution of a catalog tool, as recorded by the Tauri shell.
+///
+/// Plain fields on purpose: the store owns persistence, not the wire format.
+/// `argv`/`targets`/`required_privileges` are written as JSON arrays so the
+/// rows stay readable by hand.
+pub struct AgentRun {
+    pub id: Uuid,
+    pub proposal_id: Option<Uuid>,
+    pub tool_id: String,
+    pub program: String,
+    pub argv: Vec<String>,
+    pub targets: Vec<String>,
+    pub effective_intrusiveness: String,
+    pub required_privileges: Vec<String>,
+    pub started_at: SystemTime,
+    pub completed_at: SystemTime,
+    /// Process exit status, when the tool ran to completion.
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -91,8 +116,13 @@ impl Store {
         match version {
             v if v == SCHEMA_VERSION => {}
             // Upgrade in place: an existing project must keep opening, and
-            // gaining non-HTTP capture must not require re-importing anything.
-            1 => migrate_v1_to_v2(&conn)?,
+            // gaining capture must not require re-importing anything. Each
+            // step is idempotent, so the chain is safe to re-run.
+            1 => {
+                migrate_v1_to_v2(&conn)?;
+                migrate_v2_to_v3(&conn)?;
+            }
+            2 => migrate_v2_to_v3(&conn)?,
             other => {
                 return Err(StoreError::SchemaVersion {
                     found: other,
@@ -257,14 +287,102 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))?)
     }
+
+    /// Append many forwarded WebSocket frames in **one** transaction.
+    ///
+    /// Only frames that actually went on the wire are stored: a dropped frame
+    /// is a decision, not traffic.
+    pub fn append_ws_messages(&mut self, messages: &[WsMessage]) -> Result<(), StoreError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for message in messages {
+            tx.execute(APPEND_WS_MESSAGE_SQL, ws_params(message))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Append one forwarded frame. `INSERT OR REPLACE` on the frame id, so a
+    /// second event for the same frame never duplicates the row.
+    pub fn append_ws_message(&self, message: &WsMessage) -> Result<(), StoreError> {
+        self.conn
+            .execute(APPEND_WS_MESSAGE_SQL, ws_params(message))?;
+        Ok(())
+    }
+
+    /// The most recent `limit` stored frames, **oldest first** so the history
+    /// reads chronologically like the HTTP one.
+    pub fn list_ws_messages(&self, limit: usize) -> Result<Vec<WsMessage>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {WS_COLUMNS} FROM (\
+                 SELECT {WS_COLUMNS} FROM ws_messages ORDER BY at DESC LIMIT ?1\
+             ) ORDER BY at ASC"
+        ))?;
+        let rows = stmt.query_map([limit as i64], row_to_ws_message)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Number of stored WebSocket frames.
+    pub fn count_ws_messages(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM ws_messages", [], |r| r.get(0))?)
+    }
+
+    /// Record one approved tool execution.
+    pub fn append_agent_run(&self, run: &AgentRun) -> Result<(), StoreError> {
+        self.conn.execute(
+            UPSERT_AGENT_RUN_SQL,
+            rusqlite::params![
+                run.id.to_string(),
+                run.proposal_id.map(|id| id.to_string()),
+                run.tool_id,
+                run.program,
+                encode_string_list(&run.argv),
+                encode_string_list(&run.targets),
+                run.effective_intrusiveness,
+                encode_string_list(&run.required_privileges),
+                millis(run.started_at),
+                millis(run.completed_at),
+                run.status,
+                run.stdout.clone(),
+                run.stderr.clone(),
+                run.duration_ms as i64,
+                run.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Recorded runs, most recent first, up to `limit`.
+    pub fn list_agent_runs(&self, limit: usize) -> Result<Vec<AgentRun>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, proposal_id, tool_id, program, argv, targets, \
+             effective_intrusiveness, required_privileges, started_at, completed_at, \
+             status, stdout, stderr, duration_ms, error \
+             FROM agent_runs ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], row_to_agent_run)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
 }
 
 /// Create the schema. Every statement is `IF NOT EXISTS`, so this is safe on a
 /// fresh file and on one written by an earlier build.
 fn init_schema(conn: &Connection) -> Result<(), StoreError> {
-    conn.execute_batch(
-        &format!("{FLOWS_AND_SETTINGS_DDL}{STREAMS_AND_MESSAGES_DDL}"),
-    )?;
+    conn.execute_batch(&format!(
+        "{FLOWS_AND_SETTINGS_DDL}{STREAMS_AND_MESSAGES_DDL}{WS_AND_AGENT_DDL}"
+    ))?;
     Ok(())
 }
 
@@ -277,6 +395,15 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(STREAMS_AND_MESSAGES_DDL)?;
     tx.pragma_update(None, "user_version", 2)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Upgrade a v2 file to v3 by adding WebSocket frames and agent runs.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<(), StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(WS_AND_AGENT_DDL)?;
+    tx.pragma_update(None, "user_version", 3)?;
     tx.commit()?;
     Ok(())
 }
@@ -347,6 +474,47 @@ const STREAMS_AND_MESSAGES_DDL: &str = r#"
             FOREIGN KEY (stream_id) REFERENCES streams (id)
         );
         CREATE INDEX IF NOT EXISTS idx_messages_stream ON messages (stream_id, seq);
+"#;
+
+/// The v3 tables: forwarded WebSocket frames and agent execution runs.
+///
+/// No foreign keys: a frame does not belong to a [`Stream`], and a run does not
+/// belong to a [`Flow`]. `argv`/`targets`/`required_privileges` hold JSON
+/// arrays of strings.
+const WS_AND_AGENT_DDL: &str = r#"
+        CREATE TABLE IF NOT EXISTS ws_messages (
+            id            TEXT PRIMARY KEY,
+            connection_id TEXT NOT NULL,
+            at            INTEGER NOT NULL,
+            client_addr   TEXT NOT NULL,
+            scheme        TEXT NOT NULL,
+            host          TEXT NOT NULL,
+            port          INTEGER NOT NULL,
+            direction     TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            payload       BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ws_messages_at ON ws_messages (at);
+        CREATE INDEX IF NOT EXISTS idx_ws_messages_connection ON ws_messages (connection_id, at);
+
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            id                      TEXT PRIMARY KEY,
+            proposal_id             TEXT,
+            tool_id                 TEXT NOT NULL,
+            program                 TEXT NOT NULL,
+            argv                    TEXT NOT NULL,
+            targets                 TEXT NOT NULL,
+            effective_intrusiveness TEXT NOT NULL,
+            required_privileges     TEXT NOT NULL,
+            started_at              INTEGER NOT NULL,
+            completed_at            INTEGER NOT NULL,
+            status                  INTEGER,
+            stdout                  BLOB NOT NULL,
+            stderr                  BLOB NOT NULL,
+            duration_ms             INTEGER NOT NULL,
+            error                   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_started ON agent_runs (started_at);
 "#;
 
 const COLUMNS: &str = "id, started_at, completed_at, client_addr, scheme, host, port, \
@@ -432,6 +600,25 @@ const APPEND_MESSAGE_SQL: &str = r#"
     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 "#;
 
+const WS_COLUMNS: &str = "id, connection_id, at, client_addr, scheme, host, port, \
+     direction, kind, payload";
+
+const APPEND_WS_MESSAGE_SQL: &str = r#"
+    INSERT OR REPLACE INTO ws_messages (
+        id, connection_id, at, client_addr, scheme, host, port, direction, kind, payload
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+"#;
+
+const UPSERT_AGENT_RUN_SQL: &str = r#"
+    INSERT OR REPLACE INTO agent_runs (
+        id, proposal_id, tool_id, program, argv, targets, effective_intrusiveness,
+        required_privileges, started_at, completed_at, status, stdout, stderr,
+        duration_ms, error
+    ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+    )
+"#;
+
 fn stream_params(stream: &Stream) -> impl rusqlite::Params {
     (
         stream.id.to_string(),
@@ -457,6 +644,109 @@ fn message_params(message: &Message) -> impl rusqlite::Params {
         message.direction.as_token(),
         message.data.to_vec(),
     )
+}
+
+fn ws_params(message: &WsMessage) -> impl rusqlite::Params {
+    (
+        message.id.to_string(),
+        message.connection_id.to_string(),
+        millis(message.at),
+        message.client_addr.to_string(),
+        message.scheme.as_str(),
+        message.host.clone(),
+        i64::from(message.port),
+        message.direction.as_token(),
+        message.kind.as_token(),
+        message.payload.to_vec(),
+    )
+}
+
+fn row_to_ws_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<WsMessage> {
+    let id: String = row.get(0)?;
+    let connection_id: String = row.get(1)?;
+    let at: i64 = row.get(2)?;
+    let client_addr: String = row.get(3)?;
+    let scheme: String = row.get(4)?;
+    let host: String = row.get(5)?;
+    let port: i64 = row.get(6)?;
+    let direction: String = row.get(7)?;
+    let kind: String = row.get(8)?;
+    let payload: Vec<u8> = row.get(9)?;
+
+    // Same degradation policy as the other readers: a row written by this
+    // build always parses, a damaged one must not abort the listing.
+    let client_addr = client_addr
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let port = port as u16;
+    // The label is derived, not stored: it is exactly what `observe()` builds.
+    let connection = format!("{client_addr} <-> {host}:{port}");
+
+    Ok(WsMessage {
+        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+        connection,
+        connection_id: Uuid::parse_str(&connection_id).unwrap_or_else(|_| Uuid::nil()),
+        at: from_millis(at),
+        client_addr,
+        scheme: Scheme::from_token(&scheme),
+        host,
+        port,
+        direction: WsDirection::from_token(&direction),
+        kind: WsKind::from_token(&kind),
+        payload: Bytes::from(payload),
+        // A stored frame is by definition one that was forwarded.
+        paused: false,
+    })
+}
+
+fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
+    let id: String = row.get(0)?;
+    let proposal_id: Option<String> = row.get(1)?;
+    let tool_id: String = row.get(2)?;
+    let program: String = row.get(3)?;
+    let argv: String = row.get(4)?;
+    let targets: String = row.get(5)?;
+    let effective_intrusiveness: String = row.get(6)?;
+    let required_privileges: String = row.get(7)?;
+    let started_at: i64 = row.get(8)?;
+    let completed_at: i64 = row.get(9)?;
+    let status: Option<i64> = row.get(10)?;
+    let stdout: Vec<u8> = row.get(11)?;
+    let stderr: Vec<u8> = row.get(12)?;
+    let duration_ms: i64 = row.get(13)?;
+    let error: Option<String> = row.get(14)?;
+
+    Ok(AgentRun {
+        id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+        proposal_id: proposal_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+        tool_id,
+        program,
+        argv: decode_string_list(&argv),
+        targets: decode_string_list(&targets),
+        effective_intrusiveness,
+        required_privileges: decode_string_list(&required_privileges),
+        started_at: from_millis(started_at),
+        completed_at: from_millis(completed_at),
+        status: status.map(|s| s as i32),
+        stdout,
+        stderr,
+        duration_ms: duration_ms.max(0) as u64,
+        error,
+    })
+}
+
+/// JSON-encode a string vector. The encoding is plain JSON so a person can
+/// read the column with any SQLite browser.
+fn encode_string_list(values: &[String]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Inverse of [`encode_string_list`]; a damaged value degrades to empty rather
+/// than failing the whole listing.
+fn decode_string_list(raw: &str) -> Vec<String> {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn row_to_stream(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Stream, StoreError>> {
@@ -984,10 +1274,139 @@ mod tests {
         assert_eq!(&messages[2].data[..], b"third");
     }
 
+    fn sample_ws() -> WsMessage {
+        WsMessage {
+            id: Uuid::new_v4(),
+            connection: "127.0.0.1:5000 <-> example.com:443".into(),
+            connection_id: Uuid::new_v4(),
+            at: UNIX_EPOCH + Duration::from_millis(1_700_000_300_000),
+            client_addr: "127.0.0.1:5000".parse().unwrap(),
+            scheme: Scheme::Https,
+            host: "example.com".into(),
+            port: 443,
+            direction: WsDirection::ServerToClient,
+            kind: WsKind::Binary,
+            payload: Bytes::from_static(&[0x00, 0xff, 0x0a]),
+            paused: false,
+        }
+    }
+
+    fn sample_run(proposal_id: Uuid) -> AgentRun {
+        AgentRun {
+            id: Uuid::new_v4(),
+            proposal_id: Some(proposal_id),
+            tool_id: "nmap".into(),
+            program: "nmap".into(),
+            argv: vec!["-sV".into(), "127.0.0.1".into()],
+            targets: vec!["127.0.0.1".into()],
+            effective_intrusiveness: "low".into(),
+            required_privileges: vec![],
+            started_at: UNIX_EPOCH + Duration::from_millis(1_700_000_400_000),
+            completed_at: UNIX_EPOCH + Duration::from_millis(1_700_000_400_250),
+            status: Some(0),
+            stdout: b"80/tcp open\n".to_vec(),
+            stderr: vec![0x00, 0xff],
+            duration_ms: 250,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn ws_frames_round_trip_including_binary_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.elliot");
+        let frame = sample_ws();
+        {
+            let mut store = Store::create(&path, "pw").unwrap();
+            store.append_ws_message(&frame).unwrap();
+            store.append_ws_messages(&[sample_ws(), sample_ws()]).unwrap();
+            assert_eq!(store.count_ws_messages().unwrap(), 3);
+            // Same id twice: replaced, not duplicated.
+            store.append_ws_message(&frame).unwrap();
+            assert_eq!(store.count_ws_messages().unwrap(), 3);
+            // An empty batch is a no-op.
+            store.append_ws_messages(&[]).unwrap();
+        }
+
+        let store = Store::open(&path, "pw").unwrap();
+        let frames = store.list_ws_messages(10).unwrap();
+        assert_eq!(frames.len(), 3);
+        let got = frames.iter().find(|f| f.id == frame.id).unwrap();
+        assert_eq!(got.connection_id, frame.connection_id);
+        assert_eq!(got.connection, frame.connection);
+        assert_eq!(got.host, "example.com");
+        assert_eq!(got.port, 443);
+        assert_eq!(got.scheme, Scheme::Https);
+        assert_eq!(got.direction, WsDirection::ServerToClient);
+        assert_eq!(got.kind, WsKind::Binary);
+        assert_eq!(&got.payload[..], &[0x00, 0xff, 0x0a]);
+        assert_eq!(got.at, frame.at);
+        assert!(!got.paused, "stored frames are by definition forwarded");
+    }
+
+    #[test]
+    fn the_recent_ws_window_comes_back_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path().join("proj.elliot"), "pw").unwrap();
+        for i in 0..5u64 {
+            let mut frame = sample_ws();
+            frame.at = UNIX_EPOCH + Duration::from_millis(1_700_000_300_000 + i);
+            frame.payload = Bytes::from(i.to_string());
+            store.append_ws_message(&frame).unwrap();
+        }
+        let last_two = store.list_ws_messages(2).unwrap();
+        assert_eq!(last_two.len(), 2);
+        assert_eq!(&last_two[0].payload[..], b"3");
+        assert_eq!(&last_two[1].payload[..], b"4");
+    }
+
+    #[test]
+    fn agent_runs_round_trip_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.elliot");
+        let proposal = Uuid::new_v4();
+        let run = sample_run(proposal);
+        {
+            let store = Store::create(&path, "pw").unwrap();
+            store.append_agent_run(&run).unwrap();
+            let mut older = sample_run(Uuid::new_v4());
+            older.started_at = UNIX_EPOCH + Duration::from_millis(1_700_000_300_000);
+            older.completed_at = older.started_at;
+            older.status = None;
+            older.error = Some("timeout".into());
+            older.required_privileges = vec!["raw_socket".into()];
+            store.append_agent_run(&older).unwrap();
+        }
+
+        let store = Store::open(&path, "pw").unwrap();
+        let runs = store.list_agent_runs(10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, run.id, "newest first");
+        let got = &runs[0];
+        assert_eq!(got.proposal_id, Some(proposal));
+        assert_eq!(got.tool_id, "nmap");
+        assert_eq!(got.program, "nmap");
+        assert_eq!(got.argv, vec!["-sV", "127.0.0.1"]);
+        assert_eq!(got.targets, vec!["127.0.0.1"]);
+        assert_eq!(got.effective_intrusiveness, "low");
+        assert!(got.required_privileges.is_empty());
+        assert_eq!(got.started_at, run.started_at);
+        assert_eq!(got.completed_at, run.completed_at);
+        assert_eq!(got.status, Some(0));
+        assert_eq!(got.stdout, b"80/tcp open\n".to_vec());
+        assert_eq!(got.stderr, vec![0x00, 0xff], "stderr is bytes, not text");
+        assert_eq!(got.duration_ms, 250);
+        assert!(got.error.is_none());
+
+        assert_eq!(runs[1].status, None);
+        assert_eq!(runs[1].error.as_deref(), Some("timeout"));
+        assert_eq!(runs[1].required_privileges, vec!["raw_socket"]);
+    }
+
     /// A file written by the first release (HTTP flows only, `user_version` 1)
     /// must open and gain the new tables **without losing anything**.
     #[test]
-    fn a_v1_file_is_migrated_to_v2_and_keeps_its_data() {
+    fn a_v1_file_is_migrated_to_v3_and_keeps_its_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.elliot");
 
@@ -997,11 +1416,13 @@ mod tests {
             store.upsert_flow(&flow).unwrap();
             store.set_setting("scope_policy", b"kept").unwrap();
 
-            // Stand in for a v1 file: no streams/messages tables and the old
-            // version stamp.
+            // Stand in for a v1 file: none of the later tables, old stamp.
             store
                 .conn
-                .execute_batch("DROP TABLE messages; DROP TABLE streams;")
+                .execute_batch(
+                    "DROP TABLE agent_runs; DROP TABLE ws_messages; \
+                     DROP TABLE messages; DROP TABLE streams;",
+                )
                 .unwrap();
             store.conn.pragma_update(None, "user_version", 1).unwrap();
             flow.id
@@ -1020,11 +1441,59 @@ mod tests {
         store
             .append_message(&sample_message(stream.id, 0, Direction::ClientToServer, b"hi"))
             .unwrap();
+        store.append_ws_message(&sample_ws()).unwrap();
+        store.append_agent_run(&sample_run(Uuid::new_v4())).unwrap();
 
         // Old data survived.
         assert!(store.get_flow(flow_id).unwrap().is_some());
         assert_eq!(store.get_setting("scope_policy").unwrap().unwrap(), b"kept".to_vec());
         assert_eq!(store.count_flows().unwrap(), 1);
+    }
+
+    /// A v2 project (streams + messages, no WebSocket/agent tables) must gain
+    /// the v3 tables without losing the streams it holds.
+    #[test]
+    fn a_v2_file_is_migrated_to_v3_and_keeps_its_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.elliot");
+
+        let (stream_id, message_id) = {
+            let mut store = Store::create(&path, "pw").unwrap();
+            let stream = sample_stream();
+            store.upsert_stream(&stream).unwrap();
+            let message = sample_message(stream.id, 0, Direction::ClientToServer, b"kept");
+            store.append_messages(std::slice::from_ref(&message)).unwrap();
+
+            // Stand in for a v2 file: the v3 tables and stamp were introduced
+            // after it was written.
+            store
+                .conn
+                .execute_batch("DROP TABLE agent_runs; DROP TABLE ws_messages;")
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 2).unwrap();
+            (stream.id, message.id)
+        };
+
+        let store = Store::open(&path, "pw").unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Old data survived.
+        let stream = store.get_stream(stream_id).unwrap().expect("stream kept");
+        assert_eq!(stream.host, "redis.internal");
+        let messages = store.messages_for(stream_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message_id);
+        assert_eq!(&messages[0].data[..], b"kept");
+
+        // And the new tables work.
+        store.append_ws_message(&sample_ws()).unwrap();
+        assert_eq!(store.count_ws_messages().unwrap(), 1);
+        store.append_agent_run(&sample_run(Uuid::new_v4())).unwrap();
+        assert_eq!(store.list_agent_runs(1).unwrap().len(), 1);
     }
 
     #[test]

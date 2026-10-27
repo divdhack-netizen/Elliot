@@ -14,6 +14,10 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = { workspace = true }
+# Agent-run vectors (argv, targets, privileges) are stored as compact JSON so a
+# human inspecting the file can read them. The store does not depend on serde
+# itself: `AgentRun` stays a plain struct and the Tauri shell shapes the view.
+serde_json = { workspace = true }
 # Message payloads are bytes, not text.
 bytes = "1"
 

@@ -175,6 +175,26 @@ pub enum WsDirection {
     ServerToClient,
 }
 
+impl WsDirection {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            WsDirection::ClientToServer => "c2s",
+            WsDirection::ServerToClient => "s2c",
+        }
+    }
+
+    /// Inverse of [`WsDirection::as_token`]. Unknown tokens fall back to
+    /// `ClientToServer`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "s2c" => WsDirection::ServerToClient,
+            _ => WsDirection::ClientToServer,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WsKind {
     Text,
@@ -182,6 +202,31 @@ pub enum WsKind {
     Ping,
     Pong,
     Close,
+}
+
+impl WsKind {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            WsKind::Text => "text",
+            WsKind::Binary => "binary",
+            WsKind::Ping => "ping",
+            WsKind::Pong => "pong",
+            WsKind::Close => "close",
+        }
+    }
+
+    /// Inverse of [`WsKind::as_token`]. Unknown tokens fall back to `Text`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "binary" => WsKind::Binary,
+            "ping" => WsKind::Ping,
+            "pong" => WsKind::Pong,
+            "close" => WsKind::Close,
+            _ => WsKind::Text,
+        }
+    }
 }
 
 /// The transport a [`Stream`] was captured on.
@@ -490,6 +535,14 @@ mod tests {
         assert_eq!(ScopeDecision::InScope.as_token(), "in");
         assert_eq!(ScopeDecision::OutOfScope.as_token(), "out");
         assert_eq!(ScopeDecision::Passthrough.as_token(), "passthrough");
+
+        assert_eq!(WsDirection::ClientToServer.as_token(), "c2s");
+        assert_eq!(WsDirection::ServerToClient.as_token(), "s2c");
+        assert_eq!(WsKind::Text.as_token(), "text");
+        assert_eq!(WsKind::Binary.as_token(), "binary");
+        assert_eq!(WsKind::Ping.as_token(), "ping");
+        assert_eq!(WsKind::Pong.as_token(), "pong");
+        assert_eq!(WsKind::Close.as_token(), "close");
     }
 
     fn sample_stream() -> Stream {
@@ -588,10 +641,25 @@ mod tests {
             assert_eq!(ScopeDecision::from_token(v.as_token()), v);
         }
 
+        for v in [WsDirection::ClientToServer, WsDirection::ServerToClient] {
+            assert_eq!(WsDirection::from_token(v.as_token()), v);
+        }
+        for v in [
+            WsKind::Text,
+            WsKind::Binary,
+            WsKind::Ping,
+            WsKind::Pong,
+            WsKind::Close,
+        ] {
+            assert_eq!(WsKind::from_token(v.as_token()), v);
+        }
+
         // An unknown token must degrade to the safe default, never panic.
         assert_eq!(Scheme::from_token("gopher"), Scheme::Http);
         assert_eq!(HttpVersion::from_token("9"), HttpVersion::Http11);
         assert_eq!(FlowState::from_token("weird"), FlowState::Pending);
         assert_eq!(ScopeDecision::from_token("weird"), ScopeDecision::InScope);
+        assert_eq!(WsDirection::from_token("weird"), WsDirection::ClientToServer);
+        assert_eq!(WsKind::from_token("weird"), WsKind::Text);
     }
 }
