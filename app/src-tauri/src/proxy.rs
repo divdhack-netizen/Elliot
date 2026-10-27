@@ -4,7 +4,7 @@
 use elliot_httpraw::{Flow, WsMessage};
 use elliot_proxy::{start, InterceptDecision, ProxyConfig, ProxyEvent, ProxyHandle};
 
-use crate::scope::ScopeState;
+use crate::scope::{ScopeState, SharedScope};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
@@ -54,7 +54,7 @@ pub struct Decision {
 pub async fn proxy_start(
     app: AppHandle,
     state: State<'_, ProxyState>,
-    scope: State<'_, ScopeState>,
+    scope: State<'_, SharedScope>,
     args: StartArgs,
 ) -> Result<(), String> {
     let mut guard = state.handle.lock().await;
@@ -83,14 +83,28 @@ pub async fn proxy_start(
         .map_err(|e| e.to_string())?;
     *guard = Some(handle);
 
-    // Pump events to the UI until the channel closes (proxy stopped).
+    // Pump events to the UI until the channel closes (proxy stopped). Captured
+    // flows are persisted here, so a project holds the HTTP history too.
     let app_for_pump = app.clone();
+    let scope_for_pump = scope.inner().clone();
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let payload = match ev {
-                ProxyEvent::FlowStarted(f) => FlowEvent { kind: "started", flow: Some(f), ws: None, error: None },
-                ProxyEvent::FlowUpdated(f) => FlowEvent { kind: "updated", flow: Some(f), ws: None, error: None },
-                ProxyEvent::FlowCompleted(f) => FlowEvent { kind: "completed", flow: Some(f), ws: None, error: None },
+                ProxyEvent::FlowStarted(f) => {
+                    persist_flow(&scope_for_pump, &f).await;
+                    FlowEvent { kind: "started", flow: Some(f), ws: None, error: None }
+                }
+                ProxyEvent::FlowUpdated(f) => {
+                    persist_flow(&scope_for_pump, &f).await;
+                    FlowEvent { kind: "updated", flow: Some(f), ws: None, error: None }
+                }
+                ProxyEvent::FlowCompleted(f) => {
+                    // The terminal state is written last, so an interrupted
+                    // capture leaves a pending flow, never a truncated one
+                    // claiming to be complete.
+                    persist_flow(&scope_for_pump, &f).await;
+                    FlowEvent { kind: "completed", flow: Some(f), ws: None, error: None }
+                }
                 ProxyEvent::WebSocket(m) => FlowEvent { kind: "ws", flow: None, ws: Some(m), error: None },
                 ProxyEvent::Error(e) => FlowEvent { kind: "error", flow: None, ws: None, error: Some(e) },
             };
@@ -99,6 +113,15 @@ pub async fn proxy_start(
     });
 
     Ok(())
+}
+
+/// Persist one flow into the open project, if there is one. A write failure is
+/// logged rather than surfaced as a UI error: capture keeps working, the
+/// project file just misses a flow.
+async fn persist_flow(scope: &ScopeState, flow: &Flow) {
+    if let Some(Err(e)) = scope.with_store(|store| store.upsert_flow(flow)).await {
+        tracing::warn!("persisting flow {}: {e}", flow.id);
+    }
 }
 
 #[tauri::command]

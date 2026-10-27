@@ -20,10 +20,17 @@ elliot-proxy = { path = "../../core/proxy" }
 elliot-httpraw = { path = "../../core/httpraw" }
 elliot-scope = { path = "../../core/scope" }
 elliot-store = { path = "../../core/store" }
+# The generic (non-HTTP) capture listener and the active-work crates it feeds.
+elliot-socks = { path = "../../core/socks" }
+elliot-repeater = { path = "../../core/repeater" }
+elliot-intruder = { path = "../../core/intruder" }
 uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# The end-to-end test drives a real client, listener and origin over sockets.
+tokio = { workspace = true, features = ["net", "time", "sync"] }
 
 [lints]
 workspace = true

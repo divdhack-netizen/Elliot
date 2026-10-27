@@ -20,6 +20,11 @@ use serde::Serialize;
 use tauri::State;
 use tokio::sync::Mutex;
 
+/// The shell manages `Arc<ScopeState>` rather than `ScopeState` so the capture
+/// pumps can hold it in their own tasks (the scope policy and the open project
+/// are needed after a command has returned).
+pub type SharedScope = Arc<ScopeState>;
+
 /// Setting key under which the scope policy is stored in the project file.
 const SCOPE_KEY: &str = "scope_policy";
 
@@ -66,6 +71,18 @@ impl ScopeState {
     /// edit applies to the next request, not to the next proxy start.
     pub fn decider(&self) -> Arc<dyn ScopeDecider> {
         self.policy.decider()
+    }
+
+    /// Run `f` against the open project's store, or `None` when no project is
+    /// open.
+    ///
+    /// This is how the capture pumps persist what they observe: without a
+    /// project there is no encrypted file to write to, so nothing is written
+    /// anywhere. The lock is held for the (synchronous, short) duration of the
+    /// call.
+    pub async fn with_store<R>(&self, f: impl FnOnce(&Store) -> R) -> Option<R> {
+        let guard = self.project.lock().await;
+        guard.as_ref().map(|project| f(&project.store))
     }
 
     pub fn policy(&self) -> ScopePolicy {
@@ -194,13 +211,13 @@ fn resolve_path(state: &ScopeState, path: Option<String>) -> PathBuf {
 }
 
 #[tauri::command]
-pub async fn project_status(state: State<'_, ScopeState>) -> Result<ProjectStatus, String> {
+pub async fn project_status(state: State<'_, SharedScope>) -> Result<ProjectStatus, String> {
     Ok(state.project_status().await)
 }
 
 #[tauri::command]
 pub async fn project_create(
-    state: State<'_, ScopeState>,
+    state: State<'_, SharedScope>,
     path: Option<String>,
     passphrase: String,
 ) -> Result<ProjectStatus, String> {
@@ -210,7 +227,7 @@ pub async fn project_create(
 
 #[tauri::command]
 pub async fn project_open(
-    state: State<'_, ScopeState>,
+    state: State<'_, SharedScope>,
     path: Option<String>,
     passphrase: String,
 ) -> Result<ProjectStatus, String> {
@@ -219,19 +236,19 @@ pub async fn project_open(
 }
 
 #[tauri::command]
-pub async fn project_close(state: State<'_, ScopeState>) -> Result<ProjectStatus, String> {
+pub async fn project_close(state: State<'_, SharedScope>) -> Result<ProjectStatus, String> {
     Ok(state.close_project().await)
 }
 
 #[tauri::command]
-pub async fn scope_get(state: State<'_, ScopeState>) -> Result<ScopePolicy, String> {
+pub async fn scope_get(state: State<'_, SharedScope>) -> Result<ScopePolicy, String> {
     Ok(state.policy())
 }
 
 /// Replace the policy. Returns whether it was persisted to the project file.
 #[tauri::command]
 pub async fn scope_set(
-    state: State<'_, ScopeState>,
+    state: State<'_, SharedScope>,
     policy: ScopePolicy,
 ) -> Result<bool, String> {
     state.set_policy(policy).await
