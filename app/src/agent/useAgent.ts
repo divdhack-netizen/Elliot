@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../proxy/backend";
-import type { Execution, Item, Proposal } from "./types";
+import type { ContextItem, Execution, Item, Proposal } from "./types";
 
 /// Agent chat state: the transcript, the sidecar lifecycle and the proposal
 /// approval path.
@@ -12,11 +12,18 @@ export function useAgent() {
   const [busy, setBusy] = useState(false);
   const [alive, setAlive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The explicit context tray, owned by the Rust side and mirrored here.
+  const [context, setContext] = useState<ContextItem[]>([]);
   // The message a stream of `chunk` events appends to.
   const streamingId = useRef<string | null>(null);
   const nextId = useRef(1);
 
   useEffect(() => {
+    // The tray lives in Rust (it is cleared there on a project change); this is
+    // only the mirror the chips render.
+    void invoke<ContextItem[]>("agent_context_list")
+      .then(setContext)
+      .catch(() => {});
     const unlisteners = [
       listen<{ text: string }>("agent://chunk", ({ text }) => {
         setItems((prev) => {
@@ -52,6 +59,7 @@ export function useAgent() {
           { kind: "execution", id: `x${nextId.current++}`, execution },
         ]);
       }),
+      listen<ContextItem[]>("agent://context", (items) => setContext(items)),
       listen("agent://exit", () => {
         streamingId.current = null;
         setBusy(false);
@@ -142,7 +150,26 @@ export function useAgent() {
     setError(null);
   }, []);
 
-  return { items, busy, alive, error, send, propose, run, stop, clear };
+  const removeContext = useCallback(async (id: string) => {
+    try {
+      setContext(await invoke<ContextItem[]>("agent_context_remove", { id }));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const clearContext = useCallback(async () => {
+    try {
+      setContext(await invoke<ContextItem[]>("agent_context_clear"));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  return {
+    items, busy, alive, error, context,
+    send, propose, run, stop, clear, removeContext, clearContext,
+  };
 }
 
 export type AgentApi = ReturnType<typeof useAgent>;

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { SplitPane } from "../components/SplitPane";
 import { invoke } from "../proxy/backend";
-import { decode, fmtBytes, fmtClock, timeMs } from "../proxy/format";
+import { decode, fmtBytes, fmtClock, isProbablyText, timeMs } from "../proxy/format";
+import type { ContextInput } from "../agent/types";
 import { HexDump } from "../proxy/MessageViewer";
 import { DEFAULT_IDLE_MS, DEFAULT_TIMEOUT_MS, type AttackArgs, type RepeatArgs } from "../replay/types";
 import type { MessageWire, StreamWire } from "./types";
@@ -10,6 +11,8 @@ import { useCapture } from "./useCapture";
 type Props = {
   onSendToRepeater: (args: RepeatArgs) => void;
   onSendToIntruder: (args: AttackArgs) => void;
+  /// Attach the selected message to the agent's context tray.
+  onSendToAgent?: (item: ContextInput) => void;
 };
 
 type ByteTab = "hex" | "text";
@@ -17,7 +20,7 @@ type ByteTab = "hex" | "text";
 /// Capture of non-HTTP traffic: point a client (or `proxychains`) at the SOCKS
 /// listener and the raw streams show up here, ready to hand to the repeater or
 /// the intruder.
-export function CaptureScreen({ onSendToRepeater, onSendToIntruder }: Props) {
+export function CaptureScreen({ onSendToRepeater, onSendToIntruder, onSendToAgent }: Props) {
   const api = useCapture();
   const [selectedStream, setSelectedStream] = useState<string | null>(null);
   const [selectedMessage, setSelectedMessage] = useState<string | null>(null);
@@ -277,6 +280,14 @@ export function CaptureScreen({ onSendToRepeater, onSendToIntruder }: Props) {
                 >
                   → Intruder
                 </button>
+                <button
+                  className="btn ghost"
+                  disabled={!message || !stream || !onSendToAgent}
+                  onClick={() => message && stream && onSendToAgent?.(agentItem(stream, message))}
+                  title="Attach these bytes to the agent's context"
+                >
+                  → Agent
+                </button>
               </header>
               <div className="viewer-body">
                 {!message ? (
@@ -316,6 +327,23 @@ export function CaptureScreen({ onSendToRepeater, onSendToIntruder }: Props) {
       </footer>
     </div>
   );
+}
+
+/// The context item for one captured message. Binary payloads carry a hex
+/// preview plus their length instead of a lossy decode.
+function agentItem(s: StreamWire, m: MessageWire): ContextInput {
+  const text = isProbablyText(m.data)
+    ? decode(m.data)
+    : `[binary, ${m.data.length} bytes]\n${m.data
+        .slice(0, 256)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ")}`;
+  return {
+    label: `${s.transport} ${s.host}:${s.port} message ${m.seq}`,
+    target: `${s.transport.toLowerCase()}://${s.host}:${s.port}`,
+    text,
+    source: `message:${m.id}`,
+  };
 }
 
 function stateLabel(stream: StreamWire): string {

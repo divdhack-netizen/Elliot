@@ -53,6 +53,31 @@ export function AgentScreen() {
         </div>
       )}
 
+      <div className="context-bar">
+        <span className="muted small">Context ({api.context.length})</span>
+        {api.context.map((item) => (
+          <span key={item.id} className="chip" title={`${item.label} — ${item.target}`}>
+            <span className="mono small ellipsis">{item.label}</span>
+            <button
+              className="icon-btn"
+              onClick={() => void api.removeContext(item.id)}
+              title="Remove from context"
+            >
+              ✕
+            </button>
+          </span>
+        ))}
+        {api.context.length > 0 ? (
+          <button className="btn ghost" onClick={() => void api.clearContext()}>
+            Clear
+          </button>
+        ) : (
+          <span className="muted small">
+            attach a flow from Proxy or a message from Capture ("Send to Agent")
+          </span>
+        )}
+      </div>
+
       <div className="chat">
         {api.items.length === 0 && (
           <div className="placeholder big">

@@ -1,5 +1,7 @@
 import { useCallback, useState } from "react";
 import { AgentScreen } from "./agent/AgentScreen";
+import type { ContextInput } from "./agent/types";
+import { invoke } from "./proxy/backend";
 import { CaptureScreen } from "./capture/CaptureScreen";
 import { ProxyScreen } from "./proxy/ProxyScreen";
 import { IntruderScreen } from "./intruder/IntruderScreen";
@@ -32,6 +34,17 @@ export default function App() {
     setScreen("intruder");
   }, []);
 
+  /// Hand captured material to the agent's context tray. The backend emits the
+  /// updated tray on `agent://context`, so the chips follow without a reload.
+  const toAgent = useCallback(async (item: ContextInput) => {
+    try {
+      await invoke("agent_attach_context", { item });
+      setScreen("agent");
+    } catch (e) {
+      console.error("agent context:", e);
+    }
+  }, []);
+
   return (
     <div className="app">
       <header className="appbar">
@@ -54,10 +67,18 @@ export default function App() {
           repeater request that was being edited. */}
       <main className="screen">
         <div className="pane" style={{ display: screen === "proxy" ? "flex" : "none" }}>
-          <ProxyScreen onSendToRepeater={toRepeater} onSendToIntruder={toIntruder} />
+          <ProxyScreen
+            onSendToRepeater={toRepeater}
+            onSendToIntruder={toIntruder}
+            onSendToAgent={(item) => void toAgent(item)}
+          />
         </div>
         <div className="pane" style={{ display: screen === "capture" ? "flex" : "none" }}>
-          <CaptureScreen onSendToRepeater={toRepeater} onSendToIntruder={toIntruder} />
+          <CaptureScreen
+            onSendToRepeater={toRepeater}
+            onSendToIntruder={toIntruder}
+            onSendToAgent={(item) => void toAgent(item)}
+          />
         </div>
         <div className="pane" style={{ display: screen === "repeater" ? "flex" : "none" }}>
           <RepeaterScreen seed={repeaterSeed} />

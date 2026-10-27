@@ -289,6 +289,17 @@ code, .mono { font-family: var(--mono); }
 
 /* ---------- Agent ---------- */
 .agent { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+/* Explicit context tray: one chip per attached flow/message. */
+.context-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 5px 12px; border-bottom: 1px solid var(--border); background: var(--bg-1);
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 260px;
+  padding: 1px 4px 1px 8px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-2);
+}
+.chip .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat {
   flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column;
   gap: 10px; padding: 14px 16px;

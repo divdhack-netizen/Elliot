@@ -14,6 +14,7 @@ import { WsViewer } from "./WsViewer";
 import { ScopePanel } from "../scope/ScopePanel";
 import { useScope } from "../scope/useScope";
 import { DEFAULT_TIMEOUT_MS, type AttackArgs, type RepeatArgs } from "../replay/types";
+import type { ContextInput } from "../agent/types";
 
 type SubTab = "intercept" | "history" | "ws" | "scope";
 
@@ -22,6 +23,9 @@ type Props = {
   /// non-HTTP message takes).
   onSendToRepeater?: (args: RepeatArgs) => void;
   onSendToIntruder?: (args: AttackArgs) => void;
+  /// Attach the selected request (and its response, when there is one) to the
+  /// agent's context tray.
+  onSendToAgent?: (item: ContextInput) => void;
 };
 
 const FILTER_EXAMPLES = [
@@ -32,7 +36,7 @@ const FILTER_EXAMPLES = [
   "!(ext == js || ext == css || mime == image)",
 ];
 
-export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) {
+export function ProxyScreen({ onSendToRepeater, onSendToIntruder, onSendToAgent }: Props = {}) {
   const api = useProxy();
   const scope = useScope();
   const [sub, setSub] = useState<SubTab>("history");
@@ -106,8 +110,22 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) 
     };
   }
 
+  /// The context item for one flow: the raw request, plus the raw response
+  /// when the exchange completed. `source` lets a re-send replace the earlier
+  /// copy instead of duplicating it.
+  function agentItem(r: Row): ContextInput {
+    const response = r.flow.response
+      ? `\n\n--- response ---\n${decode(r.flow.response.raw)}`
+      : "";
+    return {
+      label: `HTTP ${r.flow.request.method} ${r.flow.host}${r.path}`,
+      target: r.url,
+      text: `${decode(r.flow.request.raw)}${response}`,
+      source: `flow:${r.flow.id}`,
+    };
+  }
+
   function menuItems(r: Row): MenuItem[] {
-    const soon = "soon";
     return [
       {
         kind: "item",
@@ -132,7 +150,12 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) 
           });
         },
       },
-      { kind: "item", label: "Send to Agent", disabled: true, hint: soon },
+      {
+        kind: "item",
+        label: "Send to Agent",
+        disabled: !onSendToAgent,
+        onSelect: () => onSendToAgent?.(agentItem(r)),
+      },
       { kind: "separator" },
       { kind: "item", label: "Copy URL", onSelect: () => copy(r.url) },
       { kind: "item", label: "Copy as cURL", onSelect: () => copy(toCurl(r.flow)) },

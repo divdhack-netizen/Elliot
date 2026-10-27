@@ -24,6 +24,24 @@ export type Execution = {
   error: string | null;
 };
 
+/// One piece of material attached to the session (a captured flow or message).
+/// It reaches the model as data, marked as untrusted by the sidecar.
+export type ContextItem = {
+  id: string;
+  label: string;
+  target: string;
+  source: string | null;
+  text: string;
+};
+
+/// What the UI sends to attach an item; the backend assigns the id.
+export type ContextInput = {
+  label: string;
+  target: string;
+  text: string;
+  source?: string | null;
+};
+
 /// One item of the conversation, oldest first.
 export type Item =
   | { kind: "user"; id: string; text: string }
