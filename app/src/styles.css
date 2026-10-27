@@ -137,6 +137,7 @@ code, .mono { font-family: var(--mono); }
 
 .banner { display: flex; align-items: center; gap: 8px; padding: 5px 12px; font-size: 12px; }
 .banner.error { background: rgba(248, 81, 73, 0.12); color: #ffb3ae; border-bottom: 1px solid rgba(248, 81, 73, 0.35); }
+.banner.info { background: rgba(88, 166, 255, 0.1); color: #9fc7ff; border-bottom: 1px solid rgba(88, 166, 255, 0.3); }
 .banner span { flex: 1; font-family: var(--mono); }
 
 .proxy-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -317,6 +318,8 @@ code, .mono { font-family: var(--mono); }
 }
 .bubble.user { align-self: flex-end; background: var(--accent-dim); border: 1px solid rgba(255, 122, 26, 0.35); }
 .bubble.agent { align-self: flex-start; background: var(--bg-2); border: 1px solid var(--border); }
+.model-input { width: 120px; }
+.latency { margin-left: 8px; font: 10.5px var(--mono); color: var(--fg-dim); }
 .caret { display: inline-block; width: 7px; height: 13px; margin-left: 3px; vertical-align: text-bottom; background: var(--fg-dim); animation: blink 1s steps(2, start) infinite; }
 @keyframes blink { to { visibility: hidden; } }
 .composer {

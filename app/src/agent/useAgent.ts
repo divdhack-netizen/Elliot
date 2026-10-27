@@ -12,6 +12,8 @@ export function useAgent() {
   const [busy, setBusy] = useState(false);
   const [alive, setAlive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A one-line notice the screen shows and the user dismisses (project switch).
+  const [notice, setNotice] = useState<string | null>(null);
   // The explicit context tray, owned by the Rust side and mirrored here.
   const [context, setContext] = useState<ContextItem[]>([]);
   // Executions recorded in the open project.
@@ -27,6 +29,8 @@ export function useAgent() {
     }
   }, []);
   const streamingId = useRef<string | null>(null);
+  // When the request in flight was sent, for the latency badge.
+  const startedAt = useRef<number | null>(null);
   const nextId = useRef(1);
 
   useEffect(() => {
@@ -52,10 +56,20 @@ export function useAgent() {
         });
       }),
       listen("agent://done", () => {
+        const started = startedAt.current;
+        startedAt.current = null;
         streamingId.current = null;
         setBusy(false);
         setItems((prev) =>
-          prev.map((item) => (item.kind === "agent" ? { ...item, streaming: false } : item)),
+          prev.map((item) =>
+            item.kind === "agent"
+              ? {
+                  ...item,
+                  streaming: false,
+                  latencyMs: started ? Date.now() - started : item.latencyMs,
+                }
+              : item,
+          ),
         );
       }),
       listen<{ message: string }>("agent://error", ({ message }) => {
@@ -73,6 +87,9 @@ export function useAgent() {
         void loadRuns();
       }),
       listen<ContextItem[]>("agent://context", (items) => setContext(items)),
+      listen("agent://reset", () => {
+        setNotice("Project changed: conversation history and context were cleared.");
+      }),
       listen("agent://exit", () => {
         streamingId.current = null;
         setBusy(false);
@@ -84,11 +101,12 @@ export function useAgent() {
     };
   }, [loadRuns]);
 
-  const send = useCallback(async (prompt: string) => {
+  const send = useCallback(async (prompt: string, model?: string) => {
     const text = prompt.trim();
     if (!text) return;
     const agentId = `a${nextId.current++}`;
     streamingId.current = agentId;
+    startedAt.current = Date.now();
     setError(null);
     setBusy(true);
     setAlive(true);
@@ -98,10 +116,11 @@ export function useAgent() {
       { kind: "agent", id: agentId, text: "", streaming: true },
     ]);
     try {
-      await invoke("agent_send", { prompt: text });
+      await invoke("agent_send", { prompt: text, model });
     } catch (e) {
       // The sidecar could not be started or reached: surface it as a turn.
       streamingId.current = null;
+      startedAt.current = null;
       setBusy(false);
       setAlive(false);
       setError(String(e));
@@ -114,7 +133,7 @@ export function useAgent() {
 
   /// "Propose": one strict model call that only returns a proposal. There is
   /// no chat turn, so no empty agent bubble is created.
-  const propose = useCallback(async (prompt: string) => {
+  const propose = useCallback(async (prompt: string, model?: string) => {
     const text = prompt.trim();
     if (!text) return;
     setError(null);
@@ -122,7 +141,7 @@ export function useAgent() {
     setAlive(true);
     setItems((prev) => [...prev, { kind: "user", id: `u${nextId.current++}`, text }]);
     try {
-      await invoke("agent_propose", { prompt: text });
+      await invoke("agent_propose", { prompt: text, model });
     } catch (e) {
       setBusy(false);
       setAlive(false);
@@ -147,6 +166,22 @@ export function useAgent() {
     }
   }, []);
 
+  /// Reset: forget the conversation and the backend memory. The transcript and
+  /// the context tray are cleared with it; recorded runs live in the project.
+  const reset = useCallback(async () => {
+    try {
+      await invoke("agent_reset");
+    } catch (e) {
+      setError(String(e));
+    }
+    streamingId.current = null;
+    startedAt.current = null;
+    setBusy(false);
+    setItems([]);
+    setContext([]);
+    setNotice(null);
+  }, []);
+
   const stop = useCallback(async () => {
     try {
       await invoke("agent_stop");
@@ -154,6 +189,7 @@ export function useAgent() {
       setError(String(e));
     }
     streamingId.current = null;
+    startedAt.current = null;
     setBusy(false);
     setAlive(false);
   }, []);
@@ -180,8 +216,9 @@ export function useAgent() {
   }, []);
 
   return {
-    items, busy, alive, error, context, runs,
-    send, propose, run, stop, clear, removeContext, clearContext, loadRuns,
+    items, busy, alive, error, notice, context, runs,
+    send, propose, run, stop, reset, clear, removeContext, clearContext, loadRuns,
+    dismissNotice: () => setNotice(null),
   };
 }
 

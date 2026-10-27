@@ -7,26 +7,37 @@ import { useAgent } from "./useAgent";
 ///
 /// Nothing runs from here without an explicit click, and the backend re-validates
 /// the proposal at execution time — this screen is a confirmation, not a policy.
+const DEFAULT_MODEL = "llama3.2:1b";
+const MODEL_KEY = "elliot.agent.model";
+
 export function AgentScreen() {
   const api = useAgent();
   const [draft, setDraft] = useState("");
   const [showRuns, setShowRuns] = useState(false);
+  // The model name is a UI preference, not project data: keep it on the machine.
+  const [model, setModel] = useState(
+    () => localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL,
+  );
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [api.items.length, api.busy]);
 
+  useEffect(() => {
+    localStorage.setItem(MODEL_KEY, model);
+  }, [model]);
+
   function submit() {
     const text = draft;
     setDraft("");
-    void api.send(text);
+    void api.send(text, model);
   }
 
   function proposeOnly() {
     const text = draft;
     setDraft("");
-    void api.propose(text);
+    void api.propose(text, model);
   }
 
   return (
@@ -36,6 +47,15 @@ export function AgentScreen() {
           L'agente <strong>propone</strong>: schema, scope ed esecuzione restano nel core Rust.
         </span>
         <span className="spacer" />
+        <label className="addr" title="Model asked to Ollama">
+          <span className="muted small">Model</span>
+          <input
+            className="mono model-input"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            spellCheck={false}
+          />
+        </label>
         <span className={`dot ${api.alive ? (api.busy ? "busy" : "on") : ""}`} />
         <span className="muted small">
           {api.alive ? (api.busy ? "Thinking…" : "Sidecar running") : "Sidecar stopped"}
@@ -43,14 +63,28 @@ export function AgentScreen() {
         <button className="btn ghost" disabled={!api.alive} onClick={() => void api.stop()}>
           Stop
         </button>
-        <button className="btn ghost" disabled={!api.items.length} onClick={api.clear}>
-          Clear
+        <button
+          className="btn ghost"
+          disabled={!api.items.length && api.context.length === 0}
+          onClick={() => void api.reset()}
+          title="Forget the conversation and the context"
+        >
+          Reset
         </button>
       </div>
 
       {api.error && (
         <div className="banner error">
           <span>{api.error}</span>
+        </div>
+      )}
+
+      {api.notice && (
+        <div className="banner info">
+          <span>{api.notice}</span>
+          <button className="icon-btn" onClick={api.dismissNotice} title="Dismiss">
+            ✕
+          </button>
         </div>
       )}
 
@@ -116,6 +150,11 @@ export function AgentScreen() {
               <div key={item.id} className="bubble agent">
                 {item.text || (item.streaming ? "…" : "")}
                 {item.streaming && <span className="caret" />}
+                {!item.streaming && item.latencyMs != null && (
+                  <span className="latency" title="Time between send and the last chunk">
+                    {(item.latencyMs / 1000).toFixed(2)}s
+                  </span>
+                )}
               </div>
             );
           }

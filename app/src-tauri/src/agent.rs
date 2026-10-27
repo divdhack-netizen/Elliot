@@ -726,18 +726,23 @@ fn describe_rule(rule: &Rule) -> String {
 /// fields, the context and history lists) is testable without a process.
 fn build_request(
     prompt: &str,
+    model: Option<&str>,
     context: Vec<String>,
     history: &[ChatTurn],
     propose_only: bool,
 ) -> Value {
-    json!({
+    let mut request = json!({
         "v": PROTOCOL_VERSION,
         "prompt": prompt,
         "context": context,
         "history": history,
         "propose": !propose_only,
         "propose_only": propose_only,
-    })
+    });
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        request["model"] = json!(model);
+    }
+    request
 }
 
 /// Send one prompt through the sidecar, with the conversation memory.
@@ -750,6 +755,7 @@ async fn send_request(
     state: &AgentState,
     scope: &SharedScope,
     prompt: String,
+    model: Option<String>,
     propose_only: bool,
 ) -> Result<(), String> {
     if !propose_only && prompt.trim().is_empty() {
@@ -790,7 +796,7 @@ async fn send_request(
     // Curated context is data for this request only (the sidecar frames it as
     // untrusted data and puts it in the last user message).
     let context = compose_context(&scope.policy(), &state.context.lock().await);
-    let request = build_request(&prompt, context, &history, propose_only);
+    let request = build_request(&prompt, model.as_deref(), context, &history, propose_only);
     let line = format!("{request}\n");
 
     let mut guard = state.sidecar.lock().await;
@@ -832,8 +838,9 @@ pub async fn agent_send(
     state: State<'_, AgentState>,
     scope: State<'_, SharedScope>,
     prompt: String,
+    model: Option<String>,
 ) -> Result<(), String> {
-    send_request(&app, &state, scope.inner(), prompt, false).await
+    send_request(&app, &state, scope.inner(), prompt, model, false).await
 }
 
 #[tauri::command]
@@ -885,8 +892,9 @@ pub async fn agent_propose(
     state: State<'_, AgentState>,
     scope: State<'_, SharedScope>,
     prompt: String,
+    model: Option<String>,
 ) -> Result<(), String> {
-    send_request(&app, &state, scope.inner(), prompt, true).await
+    send_request(&app, &state, scope.inner(), prompt, model, true).await
 }
 
 /// Forget the conversation (the UI clears its transcript alongside this).
@@ -1167,6 +1175,7 @@ mod tests {
         }];
         let request = build_request(
             "seconda",
+            Some("llama3.2:1b"),
             vec!["Scope include: example.com".into()],
             &history,
             false,
@@ -1174,15 +1183,17 @@ mod tests {
         assert_eq!(request["v"], PROTOCOL_VERSION);
         assert_eq!(request["v"], 2);
         assert_eq!(request["prompt"], "seconda");
+        assert_eq!(request["model"], "llama3.2:1b");
         assert_eq!(request["history"][0]["role"], "user");
         assert_eq!(request["history"][0]["text"], "prima");
         assert_eq!(request["propose"], true);
         assert_eq!(request["propose_only"], false);
 
-        // A proposal-only request flips the flags.
-        let request = build_request("", vec![], &[], true);
+        // A proposal-only request flips the flags and needs no model.
+        let request = build_request("", None, vec![], &[], true);
         assert_eq!(request["propose"], false);
         assert_eq!(request["propose_only"], true);
+        assert!(request.get("model").is_none());
     }
 
     /// The reader task is what turns a reply into a remembered turn; exercise it
@@ -1361,7 +1372,7 @@ mod tests {
         assert!(context.len() > 2);
 
         // The JSON request carries that vector verbatim.
-        let request = build_request("p", context.clone(), &[], false);
+        let request = build_request("p", None, context.clone(), &[], false);
         assert_eq!(request["context"], json!(context));
     }
 

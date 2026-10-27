@@ -63,7 +63,7 @@ export type ContextInput = {
 /// One item of the conversation, oldest first.
 export type Item =
   | { kind: "user"; id: string; text: string }
-  | { kind: "agent"; id: string; text: string; streaming: boolean }
+  | { kind: "agent"; id: string; text: string; streaming: boolean; latencyMs?: number }
   | { kind: "proposal"; id: string; proposal: Proposal }
   | { kind: "execution"; id: string; execution: Execution }
   | { kind: "error"; id: string; text: string };
