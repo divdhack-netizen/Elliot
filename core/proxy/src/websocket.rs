@@ -34,13 +34,35 @@ use crate::intercept::{WsDecision, WsRegistry};
 use crate::scope::ScopeDecider;
 use crate::ProxyEvent;
 
-#[derive(Clone)]
 pub struct WsHandler {
     pub events: tokio::sync::mpsc::Sender<ProxyEvent>,
     pub scope: Arc<dyn ScopeDecider>,
     /// The same switch as the HTTP intercept, so one toggle governs both.
     pub intercept_on: Arc<AtomicBool>,
     pub registry: WsRegistry,
+    /// Identity of the socket this handler instance serves. hudsucker clones
+    /// the handler once per connection, so a fresh id per clone is what makes
+    /// it per-socket rather than per-process.
+    pub connection_id: Uuid,
+}
+
+/// A hand-written clone: the shared plumbing is copied, the connection identity
+/// is regenerated.
+///
+/// This relies on hudsucker cloning the handler **once per connection**. The
+/// end-to-end test in `tests/websocket.rs` asserts that all frames of one socket
+/// share an id and a second socket gets a different one, so if that changes the
+/// test fails instead of the history silently merging sockets.
+impl Clone for WsHandler {
+    fn clone(&self) -> Self {
+        Self {
+            events: self.events.clone(),
+            scope: self.scope.clone(),
+            intercept_on: self.intercept_on.clone(),
+            registry: self.registry.clone(),
+            connection_id: Uuid::new_v4(),
+        }
+    }
 }
 
 impl WebSocketHandler for WsHandler {
@@ -149,6 +171,7 @@ impl WsHandler {
         Some(WsMessage {
             id: Uuid::new_v4(),
             connection: format!("{client_addr} <-> {host}:{port}"),
+            connection_id: self.connection_id,
             at: SystemTime::now(),
             client_addr,
             scheme,
@@ -213,6 +236,7 @@ mod tests {
             scope,
             intercept_on: Arc::new(AtomicBool::new(false)),
             registry: WsRegistry::default(),
+            connection_id: Uuid::new_v4(),
         }
     }
 
@@ -223,6 +247,7 @@ mod tests {
             scope,
             intercept_on: Arc::new(AtomicBool::new(true)),
             registry: WsRegistry::default(),
+            connection_id: Uuid::new_v4(),
         };
         (handler, rx)
     }
@@ -235,6 +260,7 @@ mod tests {
         WsMessage {
             id: Uuid::new_v4(),
             connection: "127.0.0.1:5000 <-> example.com:443".into(),
+            connection_id: Uuid::new_v4(),
             at: SystemTime::now(),
             client_addr: addr(),
             scheme: Scheme::Https,
@@ -311,6 +337,33 @@ mod tests {
     fn with_intercept_off_data_frames_stay_observe_only() {
         let h = handler(Arc::new(AllowAll));
         assert!(!h.should_intercept(WsKind::Text));
+    }
+
+    #[test]
+    fn two_clones_get_different_connection_ids() {
+        // hudsucker clones the handler once per connection: that is where the
+        // socket identity is born.
+        let first = handler(Arc::new(AllowAll));
+        let second = first.clone();
+        assert_ne!(first.connection_id, second.connection_id);
+        // A third clone of the same original differs again: no id is reused.
+        assert_ne!(second.connection_id, first.clone().connection_id);
+    }
+
+    #[test]
+    fn an_observed_frame_carries_the_handler_connection_id() {
+        let h = handler(Arc::new(AllowAll));
+        let uri: http::Uri = "wss://example.com/chat".parse().unwrap();
+        let first = h
+            .observe(WsDirection::ClientToServer, addr(), &uri, &Message::Text("a".into()))
+            .unwrap();
+        let second = h
+            .observe(WsDirection::ServerToClient, addr(), &uri, &Message::Text("b".into()))
+            .unwrap();
+        assert_eq!(first.connection_id, h.connection_id);
+        assert_eq!(second.connection_id, h.connection_id);
+        // Different frames of the same socket, different frame ids.
+        assert_ne!(first.id, second.id);
     }
 
     #[test]

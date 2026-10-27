@@ -56,6 +56,8 @@ pub async fn start(
         scope: scope.clone(),
         intercept_on: intercept_on.clone(),
         registry: ws_registry.clone(),
+        // The template; hudsucker's per-connection clone regenerates it.
+        connection_id: Uuid::new_v4(),
     };
     let handler = Handler {
         events,

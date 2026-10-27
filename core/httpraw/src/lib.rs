@@ -143,15 +143,18 @@ impl HttpVersion {
 /// A single WebSocket message observed on an in-scope connection (Phase D).
 ///
 /// WebSocket traffic does not fit the request/response [`Flow`] shape, so it is
-/// carried as its own value. The `connection` key groups the two directions of
-/// one socket; it is derived from the client address and the server authority,
-/// so concurrent sockets from the same client to the same host currently share
-/// a key (a known limitation — stitching messages to the originating HTTP
-/// upgrade flow, and separating concurrent sockets, is a follow-up).
+/// carried as its own value. `connection` is the readable label for one socket;
+/// `connection_id` is the stable identity every frame of that socket shares, so
+/// frames can be grouped without parsing the label.
+///
+/// Stitching a socket to the HTTP upgrade flow that opened it is still out of
+/// reach: hudsucker 0.25 does not expose the upgrade request id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WsMessage {
     pub id: Uuid,
     pub connection: String,
+    /// Stable identity of the socket: all frames of one connection share it.
+    pub connection_id: Uuid,
     pub at: SystemTime,
     pub client_addr: SocketAddr,
     pub scheme: Scheme,

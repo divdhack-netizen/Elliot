@@ -44,11 +44,13 @@ export type Flow = {
 export type WsDirection = "ClientToServer" | "ServerToClient";
 export type WsKind = "Text" | "Binary" | "Ping" | "Pong" | "Close";
 
-/// One WebSocket frame observed on an in-scope connection. `paused` marks a
-/// frame held by intercept, awaiting the user's decision.
+/// One WebSocket frame observed on an in-scope connection. `connection` is the
+/// readable label; `connection_id` is stable for every frame of one socket.
+/// `paused` marks a frame held by intercept, awaiting the user's decision.
 export type WsMessage = {
   id: string;
   connection: string;
+  connection_id: string;
   at: Time;
   client_addr: string;
   scheme: "Http" | "Https";
