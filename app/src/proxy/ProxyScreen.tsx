@@ -11,8 +11,16 @@ import { HIGHLIGHTS, type Row } from "./types";
 import { useProxy } from "./useProxy";
 import { ScopePanel } from "../scope/ScopePanel";
 import { useScope } from "../scope/useScope";
+import { DEFAULT_TIMEOUT_MS, type AttackArgs, type RepeatArgs } from "../replay/types";
 
 type SubTab = "intercept" | "history" | "scope";
+
+type Props = {
+  /// Hand an HTTP request over to the active tools (the same path a captured
+  /// non-HTTP message takes).
+  onSendToRepeater?: (args: RepeatArgs) => void;
+  onSendToIntruder?: (args: AttackArgs) => void;
+};
 
 const FILTER_EXAMPLES = [
   "host contains api",
@@ -22,7 +30,7 @@ const FILTER_EXAMPLES = [
   "!(ext == js || ext == css || mime == image)",
 ];
 
-export function ProxyScreen() {
+export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) {
   const api = useProxy();
   const scope = useScope();
   const [sub, setSub] = useState<SubTab>("history");
@@ -62,11 +70,49 @@ export function ProxyScreen() {
   const closeMenu = useCallback(() => setMenu(null), []);
   const copy = (s: string) => navigator.clipboard.writeText(s);
 
+  /// The repeater/intruder arguments for one captured HTTP request. HTTP is
+  /// just one more protocol over the generic replay path.
+  function replayArgs(r: Row): RepeatArgs {
+    return {
+      host: r.flow.host,
+      port: r.flow.port,
+      tls: r.flow.scheme === "Https",
+      transport: "tcp",
+      readMode: "http",
+      idleMs: null,
+      exactBytes: null,
+      readTimeoutMs: DEFAULT_TIMEOUT_MS,
+      acceptInvalidCerts: false,
+      raw: r.flow.request.raw,
+    };
+  }
+
   function menuItems(r: Row): MenuItem[] {
     const soon = "soon";
     return [
-      { kind: "item", label: "Send to Repeater", disabled: true, hint: soon },
-      { kind: "item", label: "Send to Intruder", disabled: true, hint: soon },
+      {
+        kind: "item",
+        label: "Send to Repeater",
+        disabled: !onSendToRepeater,
+        onSelect: () => onSendToRepeater?.(replayArgs(r)),
+      },
+      {
+        kind: "item",
+        label: "Send to Intruder",
+        disabled: !onSendToIntruder,
+        onSelect: () => {
+          const { raw, ...target } = replayArgs(r);
+          onSendToIntruder?.({
+            ...target,
+            base: raw,
+            // No injection points yet: the user picks them in the Intruder tab.
+            positions: [],
+            payloadSets: [],
+            mode: "sniper",
+            concurrency: 8,
+          });
+        },
+      },
       { kind: "item", label: "Send to Agent", disabled: true, hint: soon },
       { kind: "separator" },
       { kind: "item", label: "Copy URL", onSelect: () => copy(r.url) },

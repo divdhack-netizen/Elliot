@@ -58,7 +58,10 @@ code, .mono { font-family: var(--mono); }
 .tabs button:hover:not(:disabled) { color: var(--fg); }
 .tabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
 .tabs button:disabled { color: var(--fg-faint); cursor: default; }
-.screen { flex: 1; min-height: 0; }
+.screen { flex: 1; min-height: 0; display: flex; }
+/* One screen per pane; only the active one is displayed, so switching tabs
+   never throws away an edited request. */
+.pane { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 
 /* ---------- Controls ---------- */
 .btn {
@@ -303,6 +306,38 @@ code, .mono { font-family: var(--mono); }
   background: var(--bg); color: var(--fg); font: 12.5px/1.6 var(--mono);
   white-space: pre; overflow: auto; tab-size: 2;
 }
+
+/* ---------- Capture / Repeater / Intruder ---------- */
+.toggle-inline { display: inline-flex; align-items: center; gap: 4px; color: var(--fg-dim); cursor: pointer; }
+.addr input.num, input.num { width: 84px; }
+.viewer.side { border-left: 1px solid var(--border); }
+.notice { padding: 6px 10px; color: var(--fg-dim); font-size: 11.5px; border-bottom: 1px solid var(--border); }
+
+/* Plain, non-virtualised tables (streams, messages, attack results). */
+.grid-table { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+.grid-table th {
+  position: sticky; top: 0; z-index: 1; text-align: left; padding: 4px 8px;
+  background: var(--bg-2); border-bottom: 1px solid var(--border);
+  font-family: var(--sans); font-size: 11.5px; font-weight: 600; color: var(--fg-dim);
+}
+.grid-table th.right, .grid-table td.right { text-align: right; }
+.grid-table td { padding: 3px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.03); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }
+.grid-table tbody tr { cursor: default; }
+.grid-table tbody tr:hover { background: rgba(255, 255, 255, 0.05); }
+.grid-table tbody tr.selected, .grid-table tbody tr.selected:hover { background: var(--sel); color: var(--sel-fg); }
+.grid-table tbody tr.c-error { color: #ff9b95; }
+.grid-table .placeholder { padding: 10px; }
+
+.intruder-config { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(170px, 0.7fr) minmax(230px, 1fr); min-height: 0; }
+.point-list { list-style: none; margin: 8px 0 0; padding: 0 8px; display: grid; gap: 3px; }
+.point-list li { display: grid; grid-template-columns: auto 1fr 20px; align-items: center; gap: 8px; }
+.payloads { display: grid; gap: 8px; padding: 8px; align-content: start; }
+.payloads .set { display: grid; gap: 3px; }
+.payloads .set textarea {
+  min-height: 64px; resize: vertical; padding: 6px 8px;
+  background: var(--bg); border: 1px solid var(--border-strong); border-radius: 4px; outline: none;
+}
+.payloads .set textarea:focus { border-color: var(--accent); }
 
 /* ---------- Status bar ---------- */
 .statusbar {

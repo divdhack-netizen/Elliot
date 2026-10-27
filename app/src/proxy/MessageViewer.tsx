@@ -162,7 +162,9 @@ function JsonHighlight({ text }: { text: string }) {
 }
 
 /// Wireshark "packet bytes" pane: offset | 16 hex bytes | ASCII.
-function HexDump({ bytes }: { bytes: Bytes }) {
+/// Exported because the Capture, Repeater and Intruder views show raw bytes
+/// that have no HTTP shape to parse.
+export function HexDump({ bytes }: { bytes: Bytes }) {
   const lines = useMemo(() => {
     const n = Math.min(bytes.length, HEX_LIMIT);
     const out: string[] = [];
