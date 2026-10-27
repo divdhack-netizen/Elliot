@@ -57,10 +57,19 @@ class Tool:
 
 
 def catalog_dir() -> Path:
-    """La cartella ``catalog/`` del repo, salvo override d'ambiente."""
+    """La cartella ``catalog/`` del repo, salvo override d'ambiente.
+
+    Nel binario PyInstaller il catalogo viaggia come dato (``--add-data``):
+    ``sys._MEIPASS`` è la radice dell'albero estratto, dove finisce ``catalog/``.
+    """
     override = os.environ.get(CATALOG_DIR_ENV)
     if override:
         return Path(override)
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        candidate = Path(bundled) / "catalog"
+        if candidate.is_dir():
+            return candidate
     # .../agent/elliot_agent/catalog.py -> .../catalog
     return Path(__file__).resolve().parents[2] / "catalog"
 

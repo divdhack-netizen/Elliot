@@ -15,7 +15,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${1:-$(rustc -vV | sed -n 's/^host: //p')}"
 
-PYTHON="$ROOT/agent/.venv/bin/python"
+# Python usato per impacchettare. Il default è il venv di sviluppo; se
+# PyInstaller non supporta quella versione, puntare ELLIOT_PACK_PYTHON a un
+# interprete supportato (es. un venv con 3.12/3.13) senza toccare il venv di
+# sviluppo: `ELLIOT_PACK_PYTHON=/path/to/python scripts/build-sidecar.sh`.
+PYTHON="${ELLIOT_PACK_PYTHON:-$ROOT/agent/.venv/bin/python}"
 if [[ ! -x "$PYTHON" ]]; then
   echo "manca il venv del sidecar: esegui prima 'scripts/dev.sh agent:setup'" >&2
   exit 1
@@ -39,10 +43,19 @@ from elliot_agent.__main__ import main
 main()
 PY
 
+# Il catalogo è dato di configurazione dentro il pacchetto: senza, il binario
+# impacchettato non potrebbe proporre nulla (la validazione resta nel Rust).
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+  DATA_SEP=";"
+else
+  DATA_SEP=":"
+fi
+
 "$PYTHON" -m PyInstaller \
   --onefile \
   --name elliot-agent \
   --paths "$ROOT/agent" \
+  --add-data "$ROOT/catalog${DATA_SEP}catalog" \
   --distpath "$OUT" \
   --workpath "$WORK" \
   --specpath "$WORK" \
