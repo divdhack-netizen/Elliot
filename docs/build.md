@@ -51,10 +51,12 @@ cd agent
 echo '{"prompt":"ciao"}' | .venv/bin/python -m elliot_agent
 ```
 
-Attesi: righe `{"v":1,"type":"chunk", ...}` in streaming, eventualmente una
+Attesi: righe `{"v":2,"type":"chunk", ...}` in streaming, eventualmente una
 `{"type":"proposal", ...}` e infine `{"type":"done"}`. Il processo resta vivo
 finché stdin è aperto (una richiesta per riga). Se Ollama è spento arriva
-comunque una risposta **stub** in streaming (degrado controllato).
+comunque una risposta **stub** in streaming (degrado controllato). Con una
+domanda che porta a un tool, il trailer `ELLIOT_PROPOSAL {json}` non compare in
+nessun `chunk`: diventa un frame `proposal` solo se il catalogo lo valida.
 
 Test del sidecar (senza rete, modello finto):
 
@@ -111,10 +113,47 @@ va rigenerato su ogni macchina. Senza quel file `tauri build` normale continua a
 funzionare (il sidecar non è dichiarato nella config base), ma il bundle non
 conterrà l'agente.
 
+Il **catalogo** viaggia dentro il binario (`--add-data catalog:catalog`): senza
+sarebbe un sidecar che non può proporre nulla. Il controllo rapido, con Ollama
+spento, deve mostrare i chunk e **non** `catalogo non trovato` su stderr:
+
+```bash
+TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+printf '{"v":2,"prompt":"ciao"}\n' \
+  | ELLIOT_OLLAMA_URL=http://127.0.0.1:1/api/chat \
+    app/src-tauri/binaries/elliot-agent-$TRIPLE
+```
+
+PyInstaller gira nel venv di sviluppo. Su Python molto nuovi (3.14 al momento
+in cui questo è stato scritto) serve `pyinstaller>=6.22`; se una versione non
+fosse supportata, puntare `ELLIOT_PACK_PYTHON` a un interprete supportato senza
+toccare il venv di sviluppo:
+
+```bash
+ELLIOT_PACK_PYTHON=/path/to/python3.13 bash scripts/build-sidecar.sh
+```
+
+Dopo il bundle, il sidecar deve stare accanto all'eseguibile e rispondere al
+protocollo:
+
+```bash
+ls target/release/bundle/macos/Elliot.app/Contents/MacOS/
+printf '{"v":2,"prompt":"ciao"}\n' \
+  | ELLIOT_OLLAMA_URL=http://127.0.0.1:1/api/chat \
+    target/release/bundle/macos/Elliot.app/Contents/MacOS/elliot-agent
+```
+
+Il ponte (`sidecar_command`) preferisce `<dir dell'eseguibile>/elliot-agent`, poi
+`python -m elliot_agent` in sviluppo: nel bundle non serve un Python di
+sistema.
+
 ## Note
 
 - **CLI Tauri non trovata:** è in `devDependencies`, usa `npm run tauri`.
 - **rustls, non OpenSSL:** `pkg-config`/OpenSSL non sono richiesti; in questo
   milestone il lato Rust non fa rete.
 - **Python 3.14 + macOS 27** molto recenti: `httpx` è puro Python, basso
-  rischio di wheel mancanti.
+  rischio di wheel mancanti. PyInstaller 6.22+ supporta la 3.14 (verificato).
+- **Chiave della CA:** l'app usa il keychain quando c'è; in caso contrario il
+  file cifrato `ca.key.enc`. Il backend effettivo è mostrato in `CaDialog`
+  (comando `proxy_ca_status`).

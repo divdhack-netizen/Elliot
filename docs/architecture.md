@@ -86,9 +86,10 @@ installato.
 - **Cifratura con passphrase** da subito via SQLCipher: il file contiene
   traffico sensibile (credenziali, token, PII, dati del cliente).
 - Versione dello schema salvata nel file per le migrazioni. Stato attuale:
-  **v2** — `flows` + `settings` (v1) e `streams` + `messages` (v2, traffico non
-  HTTP). Un file v1 viene **migrato all'apertura** in una transazione, senza
-  perdita di dati.
+  **v3** — `flows` + `settings` (v1), `streams` + `messages` (v2, traffico non
+  HTTP), `ws_messages` + `agent_runs` (v3, frame WebSocket inoltrati ed
+  esecuzioni dell'agente). Un file v1/v2 viene **migrato all'apertura** a catena
+  (1→2→3), ogni passo in transazione, senza perdita di dati.
 - Storico **per progetto**. Niente progetto aperto ⇒ niente scritture: la
   persistenza di flow, stream e messaggi avviene solo dentro il file cifrato.
 
@@ -435,9 +436,28 @@ davvero** un file esistente: prima lo documentava soltanto e SQLite lo avrebbe
   da `npm run tauri:build:sidecar`. La config base resta senza `externalBin`, così
   `cargo build`/`tauri build` continuano a funzionare su una macchina senza il
   binario generato.
-- **Prossimo:** contesto curato selettivo (C7: flow/cattura scelti, non l'intera
-  sessione), rotazione/revoca della CA, e le estensioni rimandate del piano
-  non-HTTP (dissector, DSL di filtro, session-replay).
+- **Fatto (2026-10-27):** follow-up di [`follow-up.md`](plans/follow-up.md) —
+  **W**: `WsMessage.connection_id` stabile per socket (Clone custom del
+  `WsHandler`: hudsucker clona l'handler una volta per connessione), evento
+  "risolto" dopo la decisione (payload post-edit, `paused: false`) e
+  persistenza dei **soli** frame inoltrati, test end-to-end attraverso
+  hudsucker (forward/edit/drop/identità per socket), storico WebSocket nella
+  sub-tab dedicata con "Reload" dal progetto. **AG**: protocollo sidecar **v2**
+  con memoria di conversazione limitata (12 turni / 6 000 caratteri, azzerata al
+  cambio progetto), **una sola** chiamata al modello per richiesta con trailer
+  `ELLIOT_PROPOSAL {json}` filtrato dallo stream (mai in un `chunk`) e pulsante
+  **Propose** (`propose_only`), tray di contesto esplicito (max 8 elementi,
+  8 KiB l'uno, "Send to Agent" da Proxy e Capture), esecuzioni persistite in
+  `agent_runs` e pannello **Runs**, modello/latenza/Reset in UI. **P**: il
+  binario PyInstaller (catalogo incluso come dato) parla il protocollo v2 nel
+  bundle; `proxy_ca_status` dichiara il backend che ha davvero custodito la
+  chiave (keychain o file cifrato) e la migrazione legacy, mostrato in
+  `CaDialog`; `externalBin` resta nell'overlay, così la config base compila
+  anche senza il binario generato.
+  Limite dichiarato: lo stitching frame ↔ flow di upgrade resta impossibile
+  con hudsucker 0.25 (nessun id della richiesta esposto).
+- **Prossimo:** rotazione/revoca della CA e multi-CA, e le estensioni rimandate
+  del piano non-HTTP (dissector, DSL di filtro, session-replay).
 
 ## Non ancora deciso
 
