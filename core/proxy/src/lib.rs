@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub use elliot_httpraw::{Flow, ScopeDecision, WsDirection, WsKind, WsMessage};
-pub use intercept::InterceptDecision;
+pub pub use intercept::{InterceptDecision, WsDecision};
 pub use scope::{AllowAll, DenyAll, ScopeDecider};
 
 /// Configuration for a proxy instance.
@@ -34,7 +34,7 @@ pub use scope::{AllowAll, DenyAll, ScopeDecider};
 pub struct ProxyConfig {
     /// Address to listen on. Must be loopback; [`start`] rejects anything else.
     pub listen_addr: SocketAddr,
-    /// Directory where the root CA (`ca.crt` + `ca.key`) is persisted.
+    /// Directory where the root CA (`ca.crt` + the key store) is persisted.
     pub ca_dir: PathBuf,
     /// Verify upstream server certificates. Default `true`.
     pub verify_upstream: bool,
@@ -60,6 +60,7 @@ pub enum ProxyEvent {
     /// A flow finished (response received, dropped, or errored).
     FlowCompleted(Flow),
     /// A WebSocket message observed on an in-scope connection (Phase D).
+    /// With `paused: true` the frame is held pending a [`WsDecision`].
     WebSocket(WsMessage),
     /// A proxy-level error not attached to a specific flow.
     Error(String),
@@ -82,6 +83,12 @@ impl ProxyHandle {
     /// already resumed.
     pub fn decide(&self, flow_id: uuid::Uuid, decision: InterceptDecision) {
         self.inner.decide(flow_id, decision);
+    }
+
+    /// Supply a decision for a paused WebSocket frame. No-op if the frame is
+    /// unknown or already resumed.
+    pub fn decide_ws(&self, message_id: uuid::Uuid, decision: WsDecision) {
+        self.inner.decide_ws(message_id, decision);
     }
 
     /// PEM of the root CA **certificate** (public), for the guided trust-store

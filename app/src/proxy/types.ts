@@ -41,7 +41,31 @@ export type Flow = {
   error: string | null;
 };
 
-export type FlowEvent = { kind: string; flow: Flow | null; error: string | null };
+export type WsDirection = "ClientToServer" | "ServerToClient";
+export type WsKind = "Text" | "Binary" | "Ping" | "Pong" | "Close";
+
+/// One WebSocket frame observed on an in-scope connection. `paused` marks a
+/// frame held by intercept, awaiting the user's decision.
+export type WsMessage = {
+  id: string;
+  connection: string;
+  at: Time;
+  client_addr: string;
+  scheme: "Http" | "Https";
+  host: string;
+  port: number;
+  direction: WsDirection;
+  kind: WsKind;
+  payload: Bytes;
+  paused: boolean;
+};
+
+export type FlowEvent = {
+  kind: string;
+  flow: Flow | null;
+  ws?: WsMessage | null;
+  error: string | null;
+};
 
 /// A flow plus the frontend-only metadata the history table needs.
 export type Row = {

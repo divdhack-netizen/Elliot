@@ -16,7 +16,7 @@ use uuid::Uuid;
 use elliot_tls::Ca;
 
 use crate::handler::Handler;
-use crate::intercept::{InterceptDecision, Registry};
+use crate::intercept::{InterceptDecision, Registry, WsDecision, WsRegistry};
 use crate::scope::ScopeDecider;
 use crate::{ProxyConfig, ProxyEvent};
 
@@ -26,6 +26,7 @@ const CERT_CACHE_SIZE: u64 = 1_000;
 pub struct EngineHandle {
     intercept_on: Arc<AtomicBool>,
     registry: Registry,
+    ws_registry: WsRegistry,
     ca_pem: String,
     shutdown: Option<oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<()>,
@@ -46,11 +47,14 @@ pub async fn start(
 
     let intercept_on = Arc::new(AtomicBool::new(false));
     let registry = Registry::default();
-    // The WebSocket handler shares the event sink and scope decider with the
-    // HTTP handler, so clone before the HTTP handler takes ownership.
+    let ws_registry = WsRegistry::default();
+    // The WebSocket handler shares the event sink, scope decider and
+    // intercept switch with the HTTP handler: one toggle governs both.
     let ws_handler = crate::websocket::WsHandler {
         events: events.clone(),
         scope: scope.clone(),
+        intercept_on: intercept_on.clone(),
+        registry: ws_registry.clone(),
     };
     let handler = Handler {
         events,
@@ -132,6 +136,7 @@ pub async fn start(
     Ok(EngineHandle {
         intercept_on,
         registry,
+        ws_registry,
         ca_pem,
         shutdown: Some(shutdown_tx),
         join,
@@ -145,6 +150,10 @@ impl EngineHandle {
 
     pub fn decide(&self, flow_id: Uuid, decision: InterceptDecision) {
         self.registry.resolve(flow_id, decision);
+    }
+
+    pub fn decide_ws(&self, message_id: Uuid, decision: WsDecision) {
+        self.ws_registry.resolve(message_id, decision);
     }
 
     pub fn ca_pem(&self) -> String {

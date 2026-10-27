@@ -160,6 +160,10 @@ pub struct WsMessage {
     pub direction: WsDirection,
     pub kind: WsKind,
     pub payload: Bytes,
+    /// True while the frame is held by intercept, awaiting a decision. The
+    /// payload is the *proposed* one (the wire bytes until an edit arrives).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

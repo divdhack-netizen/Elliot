@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen } from "./backend";
 import { toRow } from "./format";
-import type { Flow, FlowEvent, Highlight, Row } from "./types";
+import type { Flow, FlowEvent, Highlight, Row, WsMessage } from "./types";
 
 export type ProxyStatus = "stopped" | "starting" | "running";
 
@@ -13,6 +13,9 @@ export function useProxy() {
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
   const [highlights, setHighlights] = useState<Record<string, Highlight>>({});
+  // WebSocket frames held by intercept. Unlike HTTP flows they are not part of
+  // the history: a held frame disappears from the queue once decided.
+  const [wsQueue, setWsQueue] = useState<WsMessage[]>([]);
 
   // Flows keyed by id, plus insertion order for the "#" column. Kept in refs
   // and bumped via `version` so bursts of events don't copy the array per event.
@@ -23,9 +26,14 @@ export function useProxy() {
   const pending = useRef(false);
 
   useEffect(() => {
-    const un = listen<FlowEvent>("proxy://flow", ({ kind, flow, error }) => {
+    const un = listen<FlowEvent>("proxy://flow", ({ kind, flow, ws, error }) => {
       if (kind === "error") {
         setError(error);
+        return;
+      }
+      if (ws?.paused) {
+        // Held frame: announce it in the intercept queue (one entry per id).
+        setWsQueue((q) => [...q.filter((m) => m.id !== ws.id), ws]);
         return;
       }
       if (!flow) return;
@@ -83,14 +91,31 @@ export function useProxy() {
     [run],
   );
 
+  const decideWs = useCallback(
+    async (messageId: string, action: "forward" | "drop" | "forward_edited", bytes?: number[]) => {
+      const ok = await run(
+        invoke("proxy_ws_decide", {
+          args: { messageId, action, edited: bytes },
+        }).then(() => true),
+      );
+      if (ok) setWsQueue((q) => q.filter((m) => m.id !== messageId));
+      return ok;
+    },
+    [run],
+  );
+
   const forwardAll = useCallback(async () => {
     for (const r of queue) await decide(r.flow.id, "forward");
-  }, [queue, decide]);
+    for (const m of wsQueue) await decideWs(m.id, "forward");
+  }, [queue, wsQueue, decide, decideWs]);
 
   const stop = useCallback(async () => {
     await run(invoke("proxy_stop"));
     setStatus("stopped");
     setInterceptState(false);
+    // Held frames lost their channel with the engine: they will never resume
+    // from this UI, so drop them instead of showing a dead queue.
+    setWsQueue([]);
   }, [run]);
 
   const setIntercept = useCallback(
@@ -128,10 +153,13 @@ export function useProxy() {
     });
   }, []);
 
+  const clearWs = useCallback(() => setWsQueue([]), []);
+
   return {
     status, listenAddr, setListenAddr, intercept, error, setError,
-    rows, queue, highlights,
-    start, stop, setIntercept, decide, forwardAll, getCaPem, clear, remove, setHighlight,
+    rows, queue, wsQueue, highlights,
+    start, stop, setIntercept, decide, decideWs, forwardAll, clearWs,
+    getCaPem, clear, remove, setHighlight,
   };
 }
 
