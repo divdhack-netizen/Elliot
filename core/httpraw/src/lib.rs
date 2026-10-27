@@ -177,6 +177,106 @@ pub enum WsKind {
     Close,
 }
 
+/// The transport a [`Stream`] was captured on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Transport {
+    Tcp,
+    Udp,
+}
+
+impl Transport {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        }
+    }
+
+    /// Inverse of [`Transport::as_token`]. Unknown tokens fall back to `Tcp`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "udp" => Transport::Udp,
+            _ => Transport::Tcp,
+        }
+    }
+
+    /// The token passed to [`ScopeDecider::decide`] for this transport.
+    pub fn scheme(self) -> &'static str {
+        self.as_token()
+    }
+}
+
+/// Which end of a stream a [`Message`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl Direction {
+    /// Canonical token written to disk by `elliot-store`. Frozen: changing it
+    /// breaks existing project files.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Direction::ClientToServer => "c2s",
+            Direction::ServerToClient => "s2c",
+        }
+    }
+
+    /// Inverse of [`Direction::as_token`]. Unknown tokens fall back to
+    /// `ClientToServer`.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "s2c" => Direction::ServerToClient,
+            _ => Direction::ClientToServer,
+        }
+    }
+}
+
+/// A captured connection (TCP) or association (UDP) that is *not* an HTTP
+/// [`Flow`].
+///
+/// The generic, transport-agnostic counterpart of [`Flow`]: the contract
+/// between the non-HTTP capture listener (`elliot-socks`), the store and the
+/// UI. A TCP connection maps one-to-one onto a stream; a UDP association maps
+/// onto a stream whose host/port are those of the **first** datagram seen (a
+/// SOCKS UDP association may fan out to several targets — a `Message` carries
+/// the payload, not the destination).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Stream {
+    pub id: Uuid,
+    pub started_at: SystemTime,
+    pub completed_at: Option<SystemTime>,
+    pub client_addr: SocketAddr,
+    pub transport: Transport,
+    pub host: String,
+    pub port: u16,
+    /// True when the captured bytes are the application plaintext behind a
+    /// terminated (MITM) TLS session, false when they are opaque bytes.
+    pub tls: bool,
+    pub scope: ScopeDecision,
+    /// Reuses [`FlowState`]: `Pending` while open, then `Completed`/`Error`.
+    pub state: FlowState,
+    pub error: Option<String>,
+}
+
+/// One observed chunk (TCP) or datagram (UDP) on a [`Stream`]. The bytes are
+/// raw: no protocol is assumed, no framing is implied. On TCP a message is one
+/// read, so its boundaries are those of the relay's reads, not of a protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Message {
+    pub id: Uuid,
+    pub stream_id: Uuid,
+    /// Order of this message within its stream (per whole stream, both
+    /// directions counted together).
+    pub seq: u64,
+    pub at: SystemTime,
+    pub direction: Direction,
+    pub data: Bytes,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlowState {
     Pending,
@@ -365,6 +465,11 @@ mod tests {
         assert_eq!(Scheme::Http.as_str(), "http");
         assert_eq!(Scheme::Https.as_str(), "https");
 
+        assert_eq!(Transport::Tcp.as_token(), "tcp");
+        assert_eq!(Transport::Udp.as_token(), "udp");
+        assert_eq!(Direction::ClientToServer.as_token(), "c2s");
+        assert_eq!(Direction::ServerToClient.as_token(), "s2c");
+
         assert_eq!(HttpVersion::Http10.as_token(), "1.0");
         assert_eq!(HttpVersion::Http11.as_token(), "1.1");
         assert_eq!(HttpVersion::H2.as_token(), "2");
@@ -378,6 +483,65 @@ mod tests {
         assert_eq!(ScopeDecision::InScope.as_token(), "in");
         assert_eq!(ScopeDecision::OutOfScope.as_token(), "out");
         assert_eq!(ScopeDecision::Passthrough.as_token(), "passthrough");
+    }
+
+    fn sample_stream() -> Stream {
+        Stream {
+            id: Uuid::new_v4(),
+            started_at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000),
+            completed_at: Some(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_050),
+            ),
+            client_addr: "127.0.0.1:51000".parse().unwrap(),
+            transport: Transport::Tcp,
+            host: "redis.internal".into(),
+            port: 6379,
+            tls: false,
+            scope: ScopeDecision::InScope,
+            state: FlowState::Completed,
+            error: None,
+        }
+    }
+
+    /// The UI receives these over IPC as JSON, so the (de)serialization is the
+    /// contract, not an implementation detail.
+    #[test]
+    fn stream_and_message_round_trip_through_json() {
+        let stream = sample_stream();
+        let json = serde_json::to_string(&stream).unwrap();
+        let back: Stream = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, stream.id);
+        assert_eq!(back.transport, Transport::Tcp);
+        assert_eq!(back.host, "redis.internal");
+        assert_eq!(back.scope, ScopeDecision::InScope);
+        assert_eq!(back.state, FlowState::Completed);
+
+        let msg = Message {
+            id: Uuid::new_v4(),
+            stream_id: stream.id,
+            seq: 7,
+            at: std::time::UNIX_EPOCH,
+            direction: Direction::ServerToClient,
+            data: Bytes::from_static(b"+PONG\r\n"),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stream_id, stream.id);
+        assert_eq!(back.seq, 7);
+        assert_eq!(back.direction, Direction::ServerToClient);
+        assert_eq!(&back.data[..], b"+PONG\r\n");
+    }
+
+    #[test]
+    fn transport_and_direction_tokens_round_trip_and_degrade_safely() {
+        for t in [Transport::Tcp, Transport::Udp] {
+            assert_eq!(Transport::from_token(t.as_token()), t);
+        }
+        for d in [Direction::ClientToServer, Direction::ServerToClient] {
+            assert_eq!(Direction::from_token(d.as_token()), d);
+        }
+        assert_eq!(Transport::from_token("sctp"), Transport::Tcp);
+        assert_eq!(Direction::from_token("weird"), Direction::ClientToServer);
     }
 
     #[test]

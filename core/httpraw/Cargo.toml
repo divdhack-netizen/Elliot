@@ -11,3 +11,8 @@ http = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The model types cross the Tauri IPC as JSON; the round-trip is part of the
+# contract, so it is tested here rather than only end-to-end.
+serde_json = { workspace = true }
