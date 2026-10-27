@@ -11,10 +11,13 @@ rustls-pki-types = "1"
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 thiserror = { workspace = true }
+# Local CA + per-host leaf minting. `x509-parser` is required by
+# `Issuer::from_ca_cert_pem` (and unified with hudsucker's rcgen, so the
+# `Issuer` type is literally the same across the proxy and this crate).
+rcgen = { version = "0.14.7", features = ["x509-parser"] }
 
 [dev-dependencies]
-# A self-signed TLS server, to prove the permissive verifier is opt-in only.
-rcgen = "0.14"
+tempfile = "3"
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros"] }
 
 [lints]

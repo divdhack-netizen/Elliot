@@ -13,10 +13,11 @@ use hudsucker::{
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use elliot_tls::Ca;
+
 use crate::handler::Handler;
 use crate::intercept::{InterceptDecision, Registry};
 use crate::scope::ScopeDecider;
-use crate::tls::ca::Ca;
 use crate::{ProxyConfig, ProxyEvent};
 
 /// Max per-host leaf certificates cached in memory by the authority.

@@ -1,4 +1,4 @@
-//! elliot-tls — the single place that builds TLS client configuration.
+//! elliot-tls — the single place that builds TLS configuration.
 //!
 //! The repeater and the proxy both need a `rustls::ClientConfig`, and both need
 //! the same deliberate, caller-controlled "accept invalid certificates" escape
@@ -6,21 +6,39 @@
 //! permissive verifier exists in exactly one place instead of being copied (or
 //! half-implemented) per consumer.
 //!
+//! The crate also owns the local root CA and the minting of per-host leaves
+//! ([`Ca`]), shared by the HTTP proxy (hudsucker's authority) and the generic
+//! SOCKS listener (which terminates TLS itself to capture non-HTTP plaintext).
+//!
 //! The provider is always `aws-lc-rs` and the trust anchors are the bundled
 //! webpki roots — no OpenSSL anywhere on the network path.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs;
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme,
+};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio_rustls::TlsConnector;
+
+pub mod ca;
+
+pub use ca::{Ca, Leaf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
-    #[error("building the TLS client config: {0}")]
+    #[error("building the TLS config: {0}")]
     Config(#[from] rustls::Error),
+    #[error("certificate authority: {0}")]
+    Ca(#[from] rcgen::Error),
+    #[error("certificate authority file {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// A client config that verifies the server against the bundled webpki roots.
@@ -57,6 +75,24 @@ pub fn connector(accept_invalid_certs: bool) -> Result<TlsConnector, TlsError> {
     Ok(TlsConnector::from(Arc::new(client_config(
         accept_invalid_certs,
     )?)))
+}
+
+/// A `rustls::ServerConfig` presenting one freshly minted leaf — the MITM side
+/// of a generic (non-HTTP) TLS session.
+///
+/// No ALPN is advertised: the capture listener speaks no application protocol
+/// itself, it just relays the plaintext, so letting the client fall back to its
+/// own default is the honest choice.
+pub fn server_config_with_leaf(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, TlsError> {
+    Ok(
+        ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)?,
+    )
 }
 
 /// Shared builder prologue: the aws-lc-rs provider (never a process-global

@@ -15,9 +15,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 # MITM proxy engine (hyper + rustls + rcgen under the hood). Default features
 # already bring rustls-client + rcgen-ca + the decoder; http2 is opt-in.
 hudsucker = { version = "0.25", features = ["http2"] }
-# Same rcgen version hudsucker re-exports, so the `Issuer` type unifies. The
-# `x509-parser` feature is required by `Issuer::from_ca_cert_pem`.
-rcgen = { version = "0.14.7", features = ["x509-parser"] }
 
 tokio = { workspace = true, features = ["sync", "net"] }
 http = "1"
@@ -35,6 +32,7 @@ elliot-scope = { path = "../scope" }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "net", "io-util"] }
 # A self-signed loopback HTTPS server for the upstream-verification test.
 tokio-rustls = "0.26"
+rcgen = { version = "0.14.7", features = ["x509-parser"] }
 tempfile = "3"
 
 [lints]

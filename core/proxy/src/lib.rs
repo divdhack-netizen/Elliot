@@ -17,7 +17,6 @@ mod engine;
 mod handler;
 mod intercept;
 mod scope;
-mod tls;
 mod websocket;
 
 use std::net::SocketAddr;
