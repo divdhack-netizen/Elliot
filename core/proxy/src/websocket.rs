@@ -103,7 +103,12 @@ impl WebSocketHandler for WsHandler {
 
         // Default to forwarding if the core drops the channel (shutdown).
         let decision = rx.await.unwrap_or(WsDecision::Forward);
-        self.apply(decision, message, paused)
+        let (wire, resolved) = self.apply(decision, message, paused);
+        // Announce what was actually forwarded (nothing on a drop), then send it.
+        if let Some(resolved) = resolved {
+            let _ = self.events.send(ProxyEvent::WebSocket(resolved)).await;
+        }
+        wire
     }
 }
 
@@ -114,24 +119,33 @@ impl WsHandler {
             && self.intercept_on.load(Ordering::Relaxed)
     }
 
-    /// Turn a decision into the frame to forward (`None` = drop).
+    /// Turn a decision into the frame to put on the wire and the frame that was
+    /// actually forwarded (`None` = nothing forwarded, so nothing announced).
+    ///
+    /// The resolved frame carries the post-edit payload and `paused: false`, so
+    /// the history can be "what passed", not a log of decisions.
     fn apply(
         &self,
         decision: WsDecision,
         original: Message,
         observed: WsMessage,
-    ) -> Option<Message> {
+    ) -> (Option<Message>, Option<WsMessage>) {
+        let mut resolved = observed;
+        resolved.paused = false;
         match decision {
-            WsDecision::Forward => Some(original),
-            WsDecision::Drop => None,
+            WsDecision::Forward => (Some(original), Some(resolved)),
+            WsDecision::Drop => (None, None),
             WsDecision::ForwardEdited(bytes) => {
                 // Rebuild the *same* kind. A `Text` frame is only allowed to
                 // stay text when the edit is valid UTF-8; otherwise the edit is
                 // rejected and the original forwards, mirroring HTTP's
                 // behaviour on an unparsable edit.
-                match observed.kind {
+                match resolved.kind {
                     WsKind::Text => match String::from_utf8(bytes) {
-                        Ok(text) => Some(Message::text(text)),
+                        Ok(text) => {
+                            resolved.payload = Bytes::copy_from_slice(text.as_bytes());
+                            (Some(Message::text(text)), Some(resolved))
+                        }
                         Err(_) => {
                             let reason = "WebSocket edit rejected: a text frame must be UTF-8";
                             tracing::warn!("{reason}");
@@ -140,10 +154,13 @@ impl WsHandler {
                             let _ = self
                                 .events
                                 .try_send(ProxyEvent::Error(reason.to_string()));
-                            Some(original)
+                            (Some(original), Some(resolved))
                         }
                     },
-                    _ => Some(Message::binary(bytes)),
+                    _ => {
+                        resolved.payload = Bytes::copy_from_slice(&bytes);
+                        (Some(Message::binary(bytes)), Some(resolved))
+                    }
                 }
             }
         }
@@ -369,40 +386,41 @@ mod tests {
     #[test]
     fn a_forward_edit_replaces_the_payload_in_the_same_kind() {
         let (h, _rx) = intercepting(Arc::new(AllowAll));
-        let out = h
-            .apply(
-                WsDecision::ForwardEdited(b"edited".to_vec()),
-                Message::Text("original".into()),
-                observed(WsKind::Text, b"original"),
-            )
-            .expect("forwarded");
-        assert_eq!(out.to_text().unwrap(), "edited");
+        let (wire, resolved) = h.apply(
+            WsDecision::ForwardEdited(b"edited".to_vec()),
+            Message::Text("original".into()),
+            observed(WsKind::Text, b"original"),
+        );
+        assert_eq!(wire.unwrap().to_text().unwrap(), "edited");
+        let resolved = resolved.expect("a forwarded frame is announced");
+        assert_eq!(&resolved.payload[..], b"edited");
+        assert!(!resolved.paused, "the resolved frame is no longer held");
     }
 
     #[test]
     fn a_binary_edit_may_carry_non_utf8_bytes() {
         let (h, _rx) = intercepting(Arc::new(AllowAll));
-        let out = h
-            .apply(
-                WsDecision::ForwardEdited(vec![0xff, 0x00]),
-                Message::Binary(Bytes::from_static(b"original")),
-                observed(WsKind::Binary, b"original"),
-            )
-            .expect("forwarded");
-        assert_eq!(out.into_data().as_ref(), &[0xff, 0x00]);
+        let (wire, resolved) = h.apply(
+            WsDecision::ForwardEdited(vec![0xff, 0x00]),
+            Message::Binary(Bytes::from_static(b"original")),
+            observed(WsKind::Binary, b"original"),
+        );
+        assert_eq!(wire.unwrap().into_data().as_ref(), &[0xff, 0x00]);
+        assert_eq!(&resolved.unwrap().payload[..], &[0xff, 0x00]);
     }
 
     #[test]
     fn a_text_edit_that_is_not_utf8_forwards_the_original() {
         let (h, mut rx) = intercepting(Arc::new(AllowAll));
-        let out = h
-            .apply(
-                WsDecision::ForwardEdited(vec![0xff, 0xfe]),
-                Message::Text("original".into()),
-                observed(WsKind::Text, b"original"),
-            )
-            .expect("the original is forwarded instead of dropping");
-        assert_eq!(out.to_text().unwrap(), "original");
+        let (wire, resolved) = h.apply(
+            WsDecision::ForwardEdited(vec![0xff, 0xfe]),
+            Message::Text("original".into()),
+            observed(WsKind::Text, b"original"),
+        );
+        let wire = wire.expect("the original is forwarded instead of dropping");
+        assert_eq!(wire.to_text().unwrap(), "original");
+        // The resolved frame describes the original, not the rejected edit.
+        assert_eq!(&resolved.unwrap().payload[..], b"original");
         // The rejection is surfaced, not swallowed.
         match rx.try_recv() {
             Ok(ProxyEvent::Error(e)) => assert!(e.contains("UTF-8"), "got {e}"),
@@ -411,26 +429,31 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_decision_returns_none() {
+    fn a_drop_decision_forwards_and_announces_nothing() {
         let (h, _rx) = intercepting(Arc::new(AllowAll));
-        let out = h.apply(
+        let (wire, resolved) = h.apply(
             WsDecision::Drop,
             Message::Text("original".into()),
             observed(WsKind::Text, b"original"),
         );
-        assert!(out.is_none(), "a dropped frame must not be forwarded");
+        assert!(wire.is_none(), "a dropped frame must not be forwarded");
+        assert!(
+            resolved.is_none(),
+            "a dropped frame is not part of the forwarded history"
+        );
     }
 
     #[test]
     fn a_forward_decision_returns_the_original_frame() {
         let (h, _rx) = intercepting(Arc::new(AllowAll));
-        let out = h
-            .apply(
-                WsDecision::Forward,
-                Message::Text("original".into()),
-                observed(WsKind::Text, b"original"),
-            )
-            .unwrap();
-        assert_eq!(out.to_text().unwrap(), "original");
+        let (wire, resolved) = h.apply(
+            WsDecision::Forward,
+            Message::Text("original".into()),
+            observed(WsKind::Text, b"original"),
+        );
+        assert_eq!(wire.unwrap().to_text().unwrap(), "original");
+        let resolved = resolved.expect("forwarded frames are announced");
+        assert!(!resolved.paused);
+        assert_eq!(&resolved.payload[..], b"original");
     }
 }

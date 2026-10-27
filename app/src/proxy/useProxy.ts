@@ -5,6 +5,10 @@ import type { Flow, FlowEvent, Highlight, Row, WsMessage } from "./types";
 
 export type ProxyStatus = "stopped" | "starting" | "running";
 
+/// How many forwarded frames the live view keeps in memory. The project file
+/// keeps everything; this is only the window shown until "Reload".
+const WS_MEMORY_LIMIT = 2_000;
+
 /// All Proxy-screen state: the flow store, proxy lifecycle and intercept queue.
 export function useProxy() {
   const [status, setStatus] = useState<ProxyStatus>("stopped");
@@ -13,9 +17,15 @@ export function useProxy() {
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
   const [highlights, setHighlights] = useState<Record<string, Highlight>>({});
-  // WebSocket frames held by intercept. Unlike HTTP flows they are not part of
-  // the history: a held frame disappears from the queue once decided.
+  // WebSocket frames held by intercept: a held frame disappears from the queue
+  // once decided.
   const [wsQueue, setWsQueue] = useState<WsMessage[]>([]);
+  // Forwarded frames, live plus whatever "Reload" brought back from the
+  // project. Kept in a ref with a version bump, like the flow history, so a
+  // burst of frames does not copy the array once per event.
+  const wsRowsRef = useRef<WsMessage[]>([]);
+  const [wsVersion, setWsVersion] = useState(0);
+  const wsBumpQueued = useRef(false);
 
   // Flows keyed by id, plus insertion order for the "#" column. Kept in refs
   // and bumped via `version` so bursts of events don't copy the array per event.
@@ -34,6 +44,22 @@ export function useProxy() {
       if (ws?.paused) {
         // Held frame: announce it in the intercept queue (one entry per id).
         setWsQueue((q) => [...q.filter((m) => m.id !== ws.id), ws]);
+        return;
+      }
+      if (ws) {
+        // Resolved frame: it went on the wire, so it belongs to the history.
+        if (!wsRowsRef.current.some((m) => m.id === ws.id)) {
+          const next = [...wsRowsRef.current, ws];
+          wsRowsRef.current =
+            next.length > WS_MEMORY_LIMIT ? next.slice(next.length - WS_MEMORY_LIMIT) : next;
+          if (!wsBumpQueued.current) {
+            wsBumpQueued.current = true;
+            requestAnimationFrame(() => {
+              wsBumpQueued.current = false;
+              setWsVersion((v) => v + 1);
+            });
+          }
+        }
         return;
       }
       if (!flow) return;
@@ -62,6 +88,8 @@ export function useProxy() {
   }, [version]);
 
   const queue = useMemo(() => rows.filter((r) => r.flow.state === "Paused"), [rows]);
+
+  const wsRows = useMemo(() => wsRowsRef.current, [wsVersion]);
 
   const run = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
     try {
@@ -157,7 +185,7 @@ export function useProxy() {
 
   return {
     status, listenAddr, setListenAddr, intercept, error, setError,
-    rows, queue, wsQueue, highlights,
+    rows, queue, wsQueue, wsRows, highlights,
     start, stop, setIntercept, decide, decideWs, forwardAll, clearWs,
     getCaPem, clear, remove, setHighlight,
   };

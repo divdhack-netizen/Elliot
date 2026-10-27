@@ -119,7 +119,14 @@ pub async fn proxy_start(
                     persist_flow(&scope_for_pump, &f).await;
                     FlowEvent { kind: "completed", flow: Some(f), ws: None, error: None }
                 }
-                ProxyEvent::WebSocket(m) => FlowEvent { kind: "ws", flow: None, ws: Some(m), error: None },
+                ProxyEvent::WebSocket(m) => {
+                    // Only forwarded frames are history: a paused frame is a
+                    // question, and a dropped one never reached the network.
+                    if should_persist(&m) {
+                        persist_ws(&scope_for_pump, &m).await;
+                    }
+                    FlowEvent { kind: "ws", flow: None, ws: Some(m), error: None }
+                }
                 ProxyEvent::Error(e) => FlowEvent { kind: "error", flow: None, ws: None, error: Some(e) },
             };
             let _ = app_for_pump.emit("proxy://flow", payload);
@@ -136,6 +143,22 @@ async fn persist_flow(scope: &ScopeState, flow: &Flow) {
     if let Some(Err(e)) = scope.with_store(|store| store.upsert_flow(flow)).await {
         tracing::warn!("persisting flow {}: {e}", flow.id);
     }
+}
+
+/// Whether a WebSocket event belongs in the project history.
+///
+/// `paused: true` is the announcement of a frame held by intercept; the frame
+/// that was actually forwarded arrives later with `paused: false` (and, for an
+/// edit, the edited payload). A dropped frame arrives with neither, so it is
+/// never stored.
+async fn persist_ws(scope: &ScopeState, message: &WsMessage) {
+    if let Some(Err(e)) = scope.with_store(|store| store.append_ws_message(message)).await {
+        tracing::warn!("persisting ws frame {}: {e}", message.id);
+    }
+}
+
+fn should_persist(message: &WsMessage) -> bool {
+    !message.paused
 }
 
 #[tauri::command]
@@ -228,6 +251,29 @@ mod tests {
         .unwrap();
         assert_eq!(a.action, "forward_edited");
         assert_eq!(a.edited.as_deref(), Some(&b"hi"[..]));
+    }
+
+    fn ws(paused: bool) -> WsMessage {
+        WsMessage {
+            id: uuid::Uuid::new_v4(),
+            connection: "127.0.0.1:5000 <-> example.com:443".into(),
+            connection_id: uuid::Uuid::new_v4(),
+            at: std::time::SystemTime::now(),
+            client_addr: "127.0.0.1:5000".parse().unwrap(),
+            scheme: elliot_httpraw::Scheme::Https,
+            host: "example.com".into(),
+            port: 443,
+            direction: elliot_httpraw::WsDirection::ClientToServer,
+            kind: elliot_httpraw::WsKind::Text,
+            payload: b"hi".to_vec().into(),
+            paused,
+        }
+    }
+
+    #[test]
+    fn only_forwarded_ws_frames_are_persisted() {
+        assert!(!should_persist(&ws(true)), "a held frame is not history yet");
+        assert!(should_persist(&ws(false)), "a forwarded frame is history");
     }
 
     #[test]
