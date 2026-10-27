@@ -1,6 +1,6 @@
 # Elliot — registro di progettazione
 
-Documento di riferimento sulle decisioni prese. Ultimo aggiornamento: 2026-10-26.
+Documento di riferimento sulle decisioni prese. Ultimo aggiornamento: 2026-10-27.
 
 ## Visione
 
@@ -43,13 +43,17 @@ resta ingabbiata da schema + scope + conferma umana.
 Vedi [../core/README.md](../core/README.md), [../app/README.md](../app/README.md),
 [../agent/README.md](../agent/README.md). In sintesi:
 
-- **core (Rust, senza UI):** `proxy`, `scope` (fonte di verità unica), `store`
-  (SQLite/SQLCipher), `httpraw` (request raw editabile condivisa), `repeater`,
-  `intruder`, `runner` (valida+esegue), `catalog` (loader+validazione), `tls`
-  (politica TLS: config rustls + verifier permissivo dietro opt-in).
-- **app (Tauri):** `src-tauri` (guscio, IPC, agent bridge) + `src` (React, 4
-  schermate). Tab Proxy/Repeater/Intruder/Agente; staccabili in futuro, gratis
-  perché lo stato sta nel core.
+- **core (Rust, senza UI):** `proxy`, `socks` (listener SOCKS5 per traffico
+  **non-HTTP**, con scope-gate e MITM TLS opzionale), `scope` (fonte di verità
+  unica), `store` (SQLite/SQLCipher), `httpraw` (request raw editabile condivisa
+  + modello generico `Stream`/`Message`), `repeater`, `intruder`, `runner`
+  (valida+esegue), `catalog` (loader+validazione), `tls` (politica TLS: config
+  rustls + verifier permissivo dietro opt-in + CA locale con minting dei leaf
+  per-host, condivisa da proxy e socks).
+- **app (Tauri):** `src-tauri` (guscio, IPC, agent bridge) + `src` (React, 5
+  schermate). Tab Proxy/Capture/Repeater/Intruder/Agente; staccabili in futuro,
+  gratis perché lo stato sta nel core. Capture/Repeater/Intruder restano montati
+  anche quando si cambia tab, così un payload in editing non si perde.
 - **agent (Python):** loop di chat, client Ollama, costruzione della proposta.
 
 ## Storage e file di progetto
@@ -58,8 +62,12 @@ Vedi [../core/README.md](../core/README.md), [../app/README.md](../app/README.md
   body come blob interni, autosave transazionale, hand-off = copia del file).
 - **Cifratura con passphrase** da subito via SQLCipher: il file contiene
   traffico sensibile (credenziali, token, PII, dati del cliente).
-- Versione dello schema salvata nel file per le migrazioni.
-- Storico **per progetto**.
+- Versione dello schema salvata nel file per le migrazioni. Stato attuale:
+  **v2** — `flows` + `settings` (v1) e `streams` + `messages` (v2, traffico non
+  HTTP). Un file v1 viene **migrato all'apertura** in una transazione, senza
+  perdita di dati.
+- Storico **per progetto**. Niente progetto aperto ⇒ niente scritture: la
+  persistenza di flow, stream e messaggi avviene solo dentro il file cifrato.
 
 ## Catalogo tool
 
@@ -286,12 +294,89 @@ davvero** un file esistente: prima lo documentava soltanto e SQLite lo avrebbe
   da un test end-to-end sul proxy reale: policy vuota ⇒ catturata; ristretta a un
   altro host ⇒ la richiesta passa ma non viene catturata; azzerata ⇒ catturata di
   nuovo — sempre sullo stesso processo.
-- **Prossimo:** persistenza dei flow nello `store` dal proxy, `runner` dietro
-  l'approvazione umana dell'agente, UI di repeater e intruder, più la UI per i
-  messaggi WebSocket.
+- **Fatto (2026-10-27):** **intercettazione generica non-HTTP** (piano
+  `docs/plans/non-http-intercept.md`, fasi G1–G9 senza le estensioni opzionali
+  G-DISS/G-FILT/G-SESS, rimandate per scelta esplicita):
+  - **`elliot-httpraw`** — modello trasporto-agnostico: `Transport` (tcp/udp),
+    `Direction` (c2s/s2c), `Stream` (connessione/associazione catturata, con
+    host/porta/tls/scope/stato) e `Message` (un blocco TCP o un datagramma, byte
+    grezzi). Token canonici anche per `Transport`/`Direction` (formato su disco
+    congelato da un test) e round-trip JSON testato: è il contratto con
+    listener, store e UI.
+  - **nuovo crate `elliot-socks`** — listener SOCKS5 **solo loopback** (come il
+    proxy: bind non-loopback rifiutato) che implementa a mano CONNECT e UDP
+    ASSOCIATE (RFC 1928) più l'autenticazione user/password opzionale (RFC 1929,
+    confronto a tempo costante), perché è il modo in cui `curl`,
+    `proxychains` o l'OS instradano traffico arbitrario. Il **gate di scope
+    decide la cattura, non la raggiungibilità**: fuori scope (o escluso) il
+    relay è trasparente — nessun evento, nessuna decifratura, niente
+    persistenza; in scope si emettono `StreamStarted`/`Message`/
+    `StreamCompleted`. **MITM TLS opzionale**: si sbircia il primo record con
+    `peek` (senza consumarlo) e, se è un ClientHello, si terminano due TLS
+    (leaf per-host firmato dalla CA condivisa + TLS verso l'upstream) e si
+    cattura il **chiaro applicativo**; qualunque altro primo byte viene
+    relayato opaco. **UDP**: relay su `127.0.0.1`, scope-check per datagramma,
+    risposte accettate solo dagli indirizzi a cui si è già inviato (mai
+    forwardare datagrammi non sollecitati), fragment droppati, correlazione
+    best-effort documentata. Stop cooperativo: i relay in corso vedono il
+    segnale e **chiudono lo stream** (nessuno stream resta pendente).
+    24 test (parsing su vettori di byte, cattura TCP nei due versi, tunnel
+    fuori scope, MITM in chiaro vs opaco, UDP, credenziali, guardie).
+  - **CA spostata in `elliot-tls`** (`Ca::load_or_create`, `cert_pem`,
+    `into_issuer` invariati + `leaf_for_host` che minta un leaf per host/IP con
+    SAN corretto, e `server_config_with_leaf`). Il proxy HTTP usa
+    `elliot_tls::Ca` senza cambi di API pubblica (i suoi test restano verdi);
+    la CA è una sola, quindi l'utente installa un solo certificato. Il test
+    della CA fa un handshake TLS vero contro un client che si fida **solo**
+    della CA locale.
+  - **`elliot-repeater`** — `RepeatRequest` guadagna `transport` e `read_mode`,
+    con default `Tcp`+`Http` (comportamento HTTP **invariato**, coperto da un
+    test di regressione): i nuovi modi sono `UntilIdle(ms)` (prima lettura sotto
+    il timeout complessivo, poi stop dopo il silenzio), `Exact(n)` (con cap di
+    16 MiB e risposta parziale se il peer chiude), `UntilClose` e `Datagram`
+    (UDP: un datagramma out, uno in, socket nella famiglia giusta). Modo e
+    trasporto incoerenti sono rifiutati **prima** di aprire un socket; TLS su
+    UDP è un errore esplicito (niente DTLS).
+  - **`elliot-intruder`** — eredita `transport`/`read_mode` dal repeater; lo
+    scheme passato allo scope segue il trasporto (`udp`/`https`/`http`); nuova
+    `run_streaming` che consegna **ogni risultato appena completa** (la UI lo
+    mostra mentre l'attacco gira), con `run` che resta il wrapper che raccoglie
+    e ordina.
+  - **`elliot-store` schema v2** — tabelle `streams` e `messages` (+ indici),
+    `upsert_stream`/`append_message`/`append_messages` (batch transazionale),
+    `get_stream`/`list_streams`/`messages_for`/`count_streams`; apertura di un
+    file **v1 migrata a v2** in transazione, verificata da un test che conserva
+    flow e impostazioni esistenti.
+  - **guscio Tauri** — `socks_start`/`socks_stop` (CA nella stessa `ca_dir` del
+    proxy, policy di scope live), pump `socks://stream` con **persistenza**
+    degli stream e dei messaggi nel progetto aperto, `repeater_send`,
+    `intruder_run` (con eventi `intruder://result`), `send_to_repeater`/
+    `send_to_intruder` dalle byte del messaggio + target dello stream, e
+    `capture_list`/`capture_messages` per ricaricare la storia. Colmato anche
+    il gap di persistenza dei **flow HTTP**: il pump del proxy ora scrive i flow
+    nel progetto aperto. Argomenti validati per token (un token sconosciuto è un
+    errore, mai un fallback silenzioso) e test unitari sul mapping.
+  - **UI React** — nuova schermata **Capture** (liste stream/messaggi, viewer
+    hex/testo, filtro di scope già esistente) e tab **Repeater** e **Intruder**
+    funzionanti: editor byte in modalità testo/hex, parametri di target e read
+    mode, invio e vista risposta (Pretty/Raw/Hex/Headers per l'HTTP); base +
+    injection point a byte (dalla selezione o a offset), payload set (uno per
+    posizione per Pitchfork/Cluster bomb), modi, tabella risultati in streaming.
+    "Send to Repeater/Intruder" ora funziona sia dal capture non-HTTP sia dalla
+    storia HTTP (che costruisce l'argomento in locale), e le schermate restano
+    montate per non perdere un payload in editing.
+- **Prossimo:** `runner` dietro l'approvazione umana dell'agente, UI per i
+  messaggi WebSocket, e le estensioni rimandate del piano non-HTTP (dissector,
+  DSL di filtro, session-replay).
 
 ## Non ancora deciso
 
 - Formato e DSL dei filtri del proxy.
+- Estensioni rimandate del piano non-HTTP: **G-DISS** (dissector: quali
+  protocolli come primi esempi), **G-FILT** (DSL di filtro in Rust condivisa
+  UI/store), **G-SESS** (session-replay per protocolli stateful). Scelte già
+  prese e da ricordare: `SchemeMatch` **non** è stato esteso a tcp/udp (basta
+  `Any`: sul path SOCKS si passa `scheme="tcp"|"udp"`), e il SOCKS resta un
+  listener **separato** dal proxy HTTP.
 - Modalità "raw" manuale per l'utente esperto (valvola di sfogo fuori allow-list,
   con conferma, non disponibile all'agente).

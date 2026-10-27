@@ -7,10 +7,12 @@ depends on these crates.
 | crate | responsibility |
 |---|---|
 | `proxy` | MITM proxy: local CA + on-the-fly per-host certs, HTTP/1.1, HTTP/2, WebSocket. Produces request/response *flows*. Passive and intercept modes. |
+| `socks` | SOCKS5 listener (CONNECT + UDP ASSOCIATE) for **non-HTTP** traffic: a second, generic way in beside the HTTP proxy. Capture is scope-gated (out of scope = transparent tunnel), optional TLS termination on the shared CA, produces `Stream`/`Message` values. Loopback-only bind. |
+| `tls` | The single place TLS policy is decided: rustls client configs (verified or the explicit permissive opt-out), the local root CA and the minting of per-host leaves (shared by the proxy and the SOCKS listener). |
 | `scope` | Scope policy engine. The **single source of truth** for what is in/out of scope. Queried by proxy, intruder, repeater, and the tool runner. Include/exclude rules on scheme/host/port/path; host by exact or domain-suffix match (no regex, safe-by-construction). An empty scope captures everything; the include list narrows it, exclusions carve targets back out. |
-| `store` | Per-project SQLite store, SQLCipher-encrypted. The project file *is* the database. Bodies as blobs. Flow history, search, the filter DSL. |
-| `httpraw` | The shared **raw-bytes editable request** model and its serializer — deliberately non-normalizing so requests can be malformed. Used by proxy, repeater, intruder. |
-| `repeater` | Takes one request, resends it (via a raw client that does not normalize), returns the response. |
+| `store` | Per-project SQLite store, SQLCipher-encrypted. The project file *is* the database. Bodies as blobs. Schema v2: HTTP `flows` plus non-HTTP `streams`/`messages` (v1 files migrate on open). Flow history, search, the filter DSL. |
+| `httpraw` | The shared **raw-bytes editable request** model and its serializer — deliberately non-normalizing so requests can be malformed. Also the transport-agnostic `Stream`/`Message`/`Transport`/`Direction` model for non-HTTP capture. Used by proxy, socks, repeater, intruder. |
+| `repeater` | Takes one request, resends it (via a raw client that does not normalize), returns the response. Works over TCP (optionally TLS) or UDP, with an explicit `ReadMode` for protocols that have no HTTP framing. |
 | `intruder` | Automated attacks: injection points, payload sets, attack modes, concurrent execution, results with metrics. Checks `scope` before running. |
 | `runner` | The **tool runner**: receives an approved agent proposal, validates it against the catalog schema + `scope`, executes via argv (never a shell), sandboxed, captures/parses output. Verifies the binary exists first. |
 | `catalog` | Loads catalog entries and validates them against `../../catalog/schema`. Used by `runner`. (The Python agent reads the same YAML directly for grounding.) |
