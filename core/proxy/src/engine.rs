@@ -13,7 +13,7 @@ use hudsucker::{
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use elliot_tls::Ca;
+use elliot_tls::{Ca, EffectiveKeyStore};
 
 use crate::handler::Handler;
 use crate::intercept::{InterceptDecision, Registry, WsDecision, WsRegistry};
@@ -28,6 +28,9 @@ pub struct EngineHandle {
     registry: Registry,
     ws_registry: WsRegistry,
     ca_pem: String,
+    /// Which backend really held the CA key this run, read before the CA is
+    /// consumed by the issuer.
+    ca_key_store: EffectiveKeyStore,
     shutdown: Option<oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<()>,
 }
@@ -40,6 +43,7 @@ pub async fn start(
     let ca = Ca::load_or_create_with(&config.ca_dir, config.ca_key_store)
         .context("preparing root CA")?;
     let ca_pem = ca.cert_pem().to_string();
+    let ca_key_store = ca.key_store();
     let authority = RcgenAuthority::new(
         ca.into_issuer(),
         CERT_CACHE_SIZE,
@@ -141,6 +145,7 @@ pub async fn start(
         registry,
         ws_registry,
         ca_pem,
+        ca_key_store,
         shutdown: Some(shutdown_tx),
         join,
     })
@@ -161,6 +166,10 @@ impl EngineHandle {
 
     pub fn ca_pem(&self) -> String {
         self.ca_pem.clone()
+    }
+
+    pub fn ca_key_store(&self) -> EffectiveKeyStore {
+        self.ca_key_store
     }
 
     pub async fn stop(mut self) {

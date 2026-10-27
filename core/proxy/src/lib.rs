@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub use elliot_httpraw::{Flow, ScopeDecision, WsDirection, WsKind, WsMessage};
-pub use elliot_tls::KeyStore;
+pub use elliot_tls::{EffectiveKeyStore, KeyStore};
 pub use intercept::{InterceptDecision, WsDecision};
 pub use scope::{AllowAll, DenyAll, ScopeDecider};
 
@@ -100,6 +100,12 @@ impl ProxyHandle {
     /// install. The private key is never exposed.
     pub fn ca_pem(&self) -> String {
         self.inner.ca_pem()
+    }
+
+    /// Which backend actually held the CA private key for this run (the
+    /// keychain, or the encrypted file it fell back to).
+    pub fn ca_key_store(&self) -> EffectiveKeyStore {
+        self.inner.ca_key_store()
     }
 
     /// Stop the proxy and wait for it to wind down.

@@ -28,6 +28,7 @@ pub mod ca;
 mod keystore;
 
 pub use ca::{Ca, KeyStore, Leaf};
+pub use keystore::EffectiveKeyStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {

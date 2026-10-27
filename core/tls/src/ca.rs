@@ -21,7 +21,7 @@ use rcgen::{
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-use crate::keystore::{self, Secrets};
+use crate::keystore::{self, EffectiveKeyStore, Secrets};
 use crate::TlsError;
 
 pub use crate::keystore::KeyStore;
@@ -39,6 +39,8 @@ pub struct Leaf {
 pub struct Ca {
     issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
+    /// Where the private key was actually read/written in this process.
+    key_store: EffectiveKeyStore,
 }
 
 impl Ca {
@@ -77,7 +79,7 @@ impl Ca {
                     keystore::ENCRYPTED_KEY_FILE
                 )));
             };
-            let ca = Self::from_pem(cert_pem, key_pem)?;
+            let ca = Self::from_pem(cert_pem, key_pem, secrets.effective())?;
             // An upgrade may leave a plaintext key behind: it is now redundant.
             secrets.remove_legacy()?;
             Ok(ca)
@@ -87,14 +89,28 @@ impl Ca {
             std::fs::write(&cert_path, cert_pem.as_bytes())
                 .map_err(|e| keystore::io_error(&cert_path, e))?;
             secrets.remove_legacy()?;
-            Self::from_pem(cert_pem, key_pem)
+            Self::from_pem(cert_pem, key_pem, secrets.effective())
         }
     }
 
-    fn from_pem(cert_pem: String, key_pem: String) -> Result<Self, TlsError> {
+    fn from_pem(
+        cert_pem: String,
+        key_pem: String,
+        key_store: EffectiveKeyStore,
+    ) -> Result<Self, TlsError> {
         let key_pair = KeyPair::from_pem(&key_pem)?;
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)?;
-        Ok(Self { issuer, cert_pem })
+        Ok(Self {
+            issuer,
+            cert_pem,
+            key_store,
+        })
+    }
+
+    /// Which backend actually held the private key: the keychain, or the
+    /// encrypted file the keychain fell back to.
+    pub fn key_store(&self) -> EffectiveKeyStore {
+        self.key_store
     }
 
     /// Public certificate PEM (safe to export / install).
@@ -247,6 +263,30 @@ mod tests {
         // Reload with the keychain broken again: the file is found and used.
         let second = Ca::load_or_create_in(dir.path(), KeyStore::Keychain, true).unwrap();
         assert_eq!(second.cert_pem(), pem);
+    }
+
+    /// The configured store is an intention; the reported one is what actually
+    /// held the key. A failing keychain reports the encrypted file, not the
+    /// keychain it was asked for.
+    #[test]
+    fn the_effective_key_store_is_the_one_that_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(ca.key_store(), EffectiveKeyStore::EncryptedFile);
+        drop(ca);
+        let reloaded = Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(reloaded.key_store(), EffectiveKeyStore::EncryptedFile);
+
+        // A keychain that cannot answer degrades to the encrypted file.
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create_in(dir.path(), KeyStore::Keychain, true).unwrap();
+        assert_eq!(ca.key_store(), EffectiveKeyStore::EncryptedFile);
+
+        assert_eq!(EffectiveKeyStore::Keychain.as_token(), "keychain");
+        assert_eq!(
+            EffectiveKeyStore::EncryptedFile.as_token(),
+            "encrypted_file"
+        );
     }
 
     /// A certificate whose key is gone must not be silently re-minted: that

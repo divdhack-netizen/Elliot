@@ -237,6 +237,43 @@ pub async fn ws_list(
     }
 }
 
+/// Where the CA private key lives for the running proxy, and whether a legacy
+/// plaintext key was migrated away.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaStatus {
+    /// "keychain" | "encrypted_file": the backend that actually answered.
+    pub backend: &'static str,
+    pub ca_dir: String,
+    /// `ca.key.enc` present and `ca.key` gone: the key was migrated.
+    pub legacy_migrated: bool,
+}
+
+/// A legacy plaintext key is migrated when the encrypted file exists and the
+/// clear-text one no longer does.
+fn legacy_migrated(ca_dir: &std::path::Path) -> bool {
+    ca_dir.join("ca.key.enc").is_file() && !ca_dir.join("ca.key").exists()
+}
+
+#[tauri::command]
+pub async fn proxy_ca_status(
+    app: AppHandle,
+    state: State<'_, ProxyState>,
+) -> Result<CaStatus, String> {
+    let guard = state.handle.lock().await;
+    let handle = guard.as_ref().ok_or("proxy not running")?;
+    let ca_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?
+        .join("ca");
+    Ok(CaStatus {
+        backend: handle.ca_key_store().as_token(),
+        legacy_migrated: legacy_migrated(&ca_dir),
+        ca_dir: ca_dir.display().to_string(),
+    })
+}
+
 #[tauri::command]
 pub async fn proxy_get_ca_pem(state: State<'_, ProxyState>) -> Result<String, String> {
     match &*state.handle.lock().await {
@@ -283,6 +320,21 @@ mod tests {
             payload: b"hi".to_vec().into(),
             paused,
         }
+    }
+
+    #[test]
+    fn a_migrated_key_is_recognised_and_an_unmigrated_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path();
+        // Fresh install: neither file yet.
+        assert!(!legacy_migrated(ca));
+        // Legacy file still there: nothing was migrated.
+        std::fs::write(ca.join("ca.key"), b"plaintext").unwrap();
+        assert!(!legacy_migrated(ca));
+        // Migrated: encrypted file present, plaintext removed.
+        std::fs::write(ca.join("ca.key.enc"), b"sealed").unwrap();
+        std::fs::remove_file(ca.join("ca.key")).unwrap();
+        assert!(legacy_migrated(ca));
     }
 
     #[test]

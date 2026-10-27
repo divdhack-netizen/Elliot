@@ -1,7 +1,8 @@
 import { useCallback, useMemo, useState } from "react";
 import { ContextMenu, type MenuItem } from "../components/ContextMenu";
 import { SplitPane } from "../components/SplitPane";
-import { CaDialog } from "./CaDialog";
+import { invoke } from "./backend";
+import { CaDialog, type CaStatus } from "./CaDialog";
 import { FlowTable } from "./FlowTable";
 import { compileFilter, FIELD_NAMES } from "./filter";
 import { decode, toCurl } from "./format";
@@ -48,7 +49,7 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder, onSendToAgent 
   const [reqTab, setReqTab] = useState<ViewerTab>("pretty");
   const [resTab, setResTab] = useState<ViewerTab>("pretty");
   const [menu, setMenu] = useState<{ row: Row; x: number; y: number } | null>(null);
-  const [pem, setPem] = useState<string | null>(null);
+  const [ca, setCa] = useState<{ pem: string; status: CaStatus | null } | null>(null);
 
   const compiled = useMemo(() => compileFilter(filter), [filter]);
   const visible = useMemo(() => {
@@ -258,8 +259,12 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder, onSendToAgent 
           className="btn"
           disabled={!running}
           onClick={async () => {
-            const p = await api.getCaPem();
-            if (p) setPem(p);
+            const pem = await api.getCaPem();
+            if (!pem) return;
+            // The backend answers only while the proxy runs; a missing status
+            // is shown as "unknown" rather than blocking the PEM.
+            const status = await invoke<CaStatus>("proxy_ca_status").catch(() => null);
+            setCa({ pem, status });
           }}
         >
           CA certificate
@@ -414,7 +419,7 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder, onSendToAgent 
       </footer>
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.row)} onClose={closeMenu} />}
-      {pem && <CaDialog pem={pem} onClose={() => setPem(null)} />}
+      {ca && <CaDialog pem={ca.pem} status={ca.status} onClose={() => setCa(null)} />}
     </div>
   );
 }

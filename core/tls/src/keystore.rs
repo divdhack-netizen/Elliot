@@ -21,6 +21,7 @@
 //! A legacy plaintext `ca.key` is imported into the configured store and
 //! **removed** the first time it is seen ([`Ca::load_or_create`]).
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, Payload};
@@ -40,6 +41,28 @@ pub enum KeyStore {
     /// tools) must not depend on a keychain being present.
     #[default]
     EncryptedFile,
+}
+
+/// Which backend actually held the key in this run.
+///
+/// A configured [`KeyStore`] is an intention; the effective one is where the
+/// key was really read or written (the keychain may be missing, locked or
+/// denied, in which case the encrypted file is used). `elliot-tls` does not
+/// depend on serde: the shell maps this to a token for the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectiveKeyStore {
+    Keychain,
+    EncryptedFile,
+}
+
+impl EffectiveKeyStore {
+    /// Canonical token for the UI. Frozen: the frontend switches on it.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            EffectiveKeyStore::Keychain => "keychain",
+            EffectiveKeyStore::EncryptedFile => "encrypted_file",
+        }
+    }
 }
 
 /// Encrypted key file, next to `ca.crt`.
@@ -65,6 +88,8 @@ pub(crate) struct Secrets {
     /// Test hook: make every keychain operation fail, so the fallback branch is
     /// exercised without a real (and possibly prompting) keychain.
     keychain_fails: bool,
+    /// Where the key was actually read/written in this run.
+    effective: Cell<Option<EffectiveKeyStore>>,
 }
 
 impl Secrets {
@@ -73,7 +98,16 @@ impl Secrets {
             dir: dir.to_path_buf(),
             keychain: store == KeyStore::Keychain,
             keychain_fails,
+            effective: Cell::new(None),
         }
+    }
+
+    /// The backend that actually answered. Before any read/write there is no
+    /// answer yet; the encrypted file is the honest default.
+    pub(crate) fn effective(&self) -> EffectiveKeyStore {
+        self.effective
+            .get()
+            .unwrap_or(EffectiveKeyStore::EncryptedFile)
     }
 
     /// Read the key: keychain first, then the encrypted file, then a legacy
@@ -82,7 +116,10 @@ impl Secrets {
         let mut keychain_error = None;
         if self.keychain {
             match self.keychain_get() {
-                Ok(Some(pem)) => return Ok(Some(pem)),
+                Ok(Some(pem)) => {
+                    self.effective.set(Some(EffectiveKeyStore::Keychain));
+                    return Ok(Some(pem));
+                }
                 Ok(None) => {}
                 // A broken keychain is a reason to fall back, not to fail: the
                 // encrypted file is still a valid store for this CA. The error
@@ -101,7 +138,9 @@ impl Secrets {
         let encrypted = self.dir.join(ENCRYPTED_KEY_FILE);
         if encrypted.exists() {
             let seed = self.read_seed()?;
-            return self.decrypt_file(&encrypted, &seed).map(Some);
+            let pem = self.decrypt_file(&encrypted, &seed)?;
+            self.effective.set(Some(EffectiveKeyStore::EncryptedFile));
+            return Ok(Some(pem));
         }
 
         let legacy = self.dir.join(LEGACY_KEY_FILE);
@@ -128,13 +167,17 @@ impl Secrets {
     pub(crate) fn store(&self, key_pem: &str) -> Result<(), TlsError> {
         if self.keychain {
             match self.keychain_set(key_pem) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.effective.set(Some(EffectiveKeyStore::Keychain));
+                    return Ok(());
+                }
                 Err(e) => tracing::warn!(
                     "CA key: keychain store failed ({e}), falling back to {}",
                     ENCRYPTED_KEY_FILE
                 ),
             }
         }
+        self.effective.set(Some(EffectiveKeyStore::EncryptedFile));
         let seed = self.seed_or_create()?;
         let blob = encrypt(&seed, key_pem.as_bytes())?;
         write_secret(&self.dir.join(ENCRYPTED_KEY_FILE), &blob)
