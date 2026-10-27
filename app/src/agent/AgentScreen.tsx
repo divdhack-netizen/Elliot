@@ -22,6 +22,12 @@ export function AgentScreen() {
     void api.send(text);
   }
 
+  function proposeOnly() {
+    const text = draft;
+    setDraft("");
+    void api.propose(text);
+  }
+
   return (
     <div className="agent">
       <div className="toolbar">
@@ -104,6 +110,14 @@ export function AgentScreen() {
         />
         <button className="btn primary" disabled={api.busy || !draft.trim()} onClick={submit}>
           Send
+        </button>
+        <button
+          className="btn"
+          disabled={api.busy || !draft.trim()}
+          onClick={proposeOnly}
+          title="One call that only asks for a proposal (no chat)"
+        >
+          Propose
         </button>
       </div>
     </div>

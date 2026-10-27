@@ -29,19 +29,30 @@ PROPOSAL = (
 )
 
 
-def fake_model(reply_text="Ecco un piano.", proposal_json=None, calls=None):
-    """Un ``stream_chat`` finto: testo per la chat, JSON per la proposta."""
+def fake_model(reply_text="Ecco un piano.", proposal_json=None, calls=None, chunk_size=5):
+    """Un ``stream_chat`` finto, con il trailer spezzato in più chunk.
+
+    Una risposta di chat è testo normale e, se c'è una proposta, una riga
+    ``ELLIOT_PROPOSAL {json}``; la chiamata ``propose_only`` produce solo quella
+    riga. Spezzare in chunk piccoli esercita il filtro sul marker spezzato.
+    """
 
     def stream(messages, model=None):
         if calls is not None:
             calls.append(messages)
-        text = messages[-1]["content"] if messages else ""
-        if "Traduci la richiesta" in text:
+        system = messages[0]["content"] if messages else ""
+        if "AL MASSIMO una proposta" in system:
             if proposal_json is not None:
-                yield proposal_json
+                line = f"{sidecar.PROPOSAL_MARKER} {proposal_json}"
+                for i in range(0, len(line), chunk_size):
+                    yield line[i : i + chunk_size]
             return
         for word in reply_text.split(" "):
             yield word + " "
+        if proposal_json is not None:
+            line = f"\n{sidecar.PROPOSAL_MARKER} {proposal_json}"
+            for i in range(0, len(line), chunk_size):
+                yield line[i : i + chunk_size]
 
     return stream
 
@@ -151,10 +162,55 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(emitted["tool_id"], "nmap")
         self.assertEqual(emitted["targets"], ["127.0.0.1"])
 
-        # La chat e poi la proposta: due chiamate al modello.
-        self.assertEqual(len(calls), 2)
-        # The proposal prompt carries the catalog as grounding.
-        self.assertTrue(any("-sV" in m["content"] for m in calls[1]))
+        # One request, one model call (D1).
+        self.assertEqual(len(calls), 1)
+        # The catalog grounds the single call.
+        self.assertIn("-sV", calls[0][0]["content"])
+
+    def test_the_trailer_never_appears_in_a_chunk(self):
+        frames = run_sidecar(
+            [{"prompt": "scansiona 127.0.0.1"}],
+            fake_model(reply_text="Va bene.", proposal_json=PROPOSAL),
+        )
+        chunks = [f["text"] for f in frames if f["type"] == "chunk"]
+        joined = "".join(chunks)
+        self.assertNotIn(sidecar.PROPOSAL_MARKER, joined)
+        self.assertNotIn('"tool_id"', joined)
+        # Only the gap before the marker's line is emitted; the marker itself
+        # and the JSON never are.
+        self.assertEqual(joined.strip(), "Va bene.")
+        self.assertIn("proposal", [f["type"] for f in frames])
+
+    def test_propose_only_answers_with_one_call_and_no_chunks(self):
+        calls = []
+        frames = run_sidecar(
+            [{"prompt": "scansiona 127.0.0.1", "propose_only": True}],
+            fake_model(proposal_json=PROPOSAL, calls=calls),
+        )
+        self.assertEqual([f["type"] for f in frames], ["proposal", "done"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(frames[0]["tool_id"], "nmap")
+        # The strict instruction, not the chat one.
+        self.assertIn("AL MASSIMO una proposta", calls[0][0]["content"])
+
+    def test_a_partial_marker_at_the_end_is_emitted_whole(self):
+        def stream(messages, model=None):
+            yield "ciao ELLIOT_PROP"
+
+        frames = run_sidecar([{"prompt": "ciao"}], stream)
+        chunks = [f["text"] for f in frames if f["type"] == "chunk"]
+        self.assertEqual("".join(chunks), "ciao ELLIOT_PROP")
+        self.assertNotIn("proposal", [f["type"] for f in frames])
+
+    def test_a_trailer_without_a_valid_tool_produces_no_proposal(self):
+        frames = run_sidecar(
+            [{"prompt": "ciao"}],
+            fake_model(proposal_json='{"tool_id": "metasploit", "targets": ["x"]}'),
+        )
+        types = [f["type"] for f in frames]
+        self.assertNotIn("proposal", types)
+        self.assertEqual(types[-1], "done")
+        self.assertIn("chunk", types)
 
     def test_a_proposal_naming_an_unknown_tool_never_reaches_the_wire(self):
         frames = run_sidecar(
@@ -163,6 +219,11 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertNotIn("proposal", [f["type"] for f in frames])
         self.assertEqual(frames[-1]["type"], "done")
+        # Metadata leaks nowhere either: the trailer is stripped even when the
+        # proposal it carried is refused.
+        self.assertNotIn(
+            "metasploit", "".join(f.get("text", "") for f in frames)
+        )
 
     def test_the_process_handles_one_request_after_another(self):
         frames = run_sidecar(

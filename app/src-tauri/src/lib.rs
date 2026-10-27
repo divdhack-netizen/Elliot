@@ -51,6 +51,7 @@ pub fn run() {
             replay::send_to_repeater,
             replay::send_to_intruder,
             agent::agent_send,
+            agent::agent_propose,
             agent::agent_reset,
             agent::agent_stop,
             agent::agent_execute,

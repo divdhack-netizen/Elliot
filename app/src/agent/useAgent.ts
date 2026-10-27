@@ -91,6 +91,28 @@ export function useAgent() {
     }
   }, []);
 
+  /// "Propose": one strict model call that only returns a proposal. There is
+  /// no chat turn, so no empty agent bubble is created.
+  const propose = useCallback(async (prompt: string) => {
+    const text = prompt.trim();
+    if (!text) return;
+    setError(null);
+    setBusy(true);
+    setAlive(true);
+    setItems((prev) => [...prev, { kind: "user", id: `u${nextId.current++}`, text }]);
+    try {
+      await invoke("agent_propose", { prompt: text });
+    } catch (e) {
+      setBusy(false);
+      setAlive(false);
+      setError(String(e));
+      setItems((prev) => [
+        ...prev,
+        { kind: "error", id: `e${nextId.current++}`, text: String(e) },
+      ]);
+    }
+  }, []);
+
   const run = useCallback(async (proposalId: string, allowDangerous: boolean) => {
     try {
       setError(null);
@@ -120,7 +142,7 @@ export function useAgent() {
     setError(null);
   }, []);
 
-  return { items, busy, alive, error, send, run, stop, clear };
+  return { items, busy, alive, error, send, propose, run, stop, clear };
 }
 
 export type AgentApi = ReturnType<typeof useAgent>;

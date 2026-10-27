@@ -93,6 +93,8 @@ pub struct Session {
     /// Text accumulated from the chunks of the request in flight.
     last_reply: Mutex<String>,
     streaming: AtomicBool,
+    /// Whether the request in flight is a proposal-only one (no history turn).
+    propose_only: AtomicBool,
 }
 
 impl Session {
@@ -414,8 +416,10 @@ pub async fn pump<R: tokio::io::AsyncRead + Unpin>(
                     }
                     Ok(Frame::Done) => {
                         let reply = std::mem::take(&mut *session.last_reply.lock().await);
-                        // An empty reply is not a turn worth remembering.
-                        if !reply.trim().is_empty() {
+                        let propose_only = session.propose_only.swap(false, Ordering::SeqCst);
+                        // A proposal-only request is not part of the chat, and
+                        // an empty reply is not a turn worth remembering.
+                        if !propose_only && !reply.trim().is_empty() {
                             session.push_turn("assistant", reply).await;
                         }
                         session.finish();
@@ -450,6 +454,7 @@ pub async fn pump<R: tokio::io::AsyncRead + Unpin>(
     }
     // The sidecar is gone: whatever was streaming will never finish.
     session.finish();
+    session.propose_only.store(false, Ordering::SeqCst);
     sink.push(EVENT_EXIT, json!({}));
 }
 
@@ -566,12 +571,19 @@ fn describe_rule(rule: &Rule) -> String {
 
 /// The JSON request the sidecar receives. Split out so the shape (version,
 /// fields, the context and history lists) is testable without a process.
-fn build_request(prompt: &str, context: Vec<String>, history: &[ChatTurn]) -> Value {
+fn build_request(
+    prompt: &str,
+    context: Vec<String>,
+    history: &[ChatTurn],
+    propose_only: bool,
+) -> Value {
     json!({
         "v": PROTOCOL_VERSION,
         "prompt": prompt,
         "context": context,
         "history": history,
+        "propose": !propose_only,
+        "propose_only": propose_only,
     })
 }
 
@@ -585,8 +597,9 @@ async fn send_request(
     state: &AgentState,
     scope: &SharedScope,
     prompt: String,
+    propose_only: bool,
 ) -> Result<(), String> {
-    if prompt.trim().is_empty() {
+    if !propose_only && prompt.trim().is_empty() {
         return Err("prompt vuoto".into());
     }
     // A project change invalidates the memory: the old target's material must
@@ -611,15 +624,18 @@ async fn send_request(
     }
 
     state.session.begin()?;
+    state.session.propose_only.store(propose_only, Ordering::SeqCst);
     *state.session.last_reply.lock().await = String::new();
 
     // The prompt is sent as its own message; `history` is what came before.
     let history = state.session.history().await;
-    state.session.push_turn("user", prompt.clone()).await;
+    if !propose_only {
+        state.session.push_turn("user", prompt.clone()).await;
+    }
     // Curated context is data for this request only (the sidecar frames it as
     // untrusted data and puts it in the last user message).
     let context = curated_context(&scope.policy());
-    let request = build_request(&prompt, context, &history);
+    let request = build_request(&prompt, context, &history, propose_only);
     let line = format!("{request}\n");
 
     let mut guard = state.sidecar.lock().await;
@@ -662,7 +678,19 @@ pub async fn agent_send(
     scope: State<'_, SharedScope>,
     prompt: String,
 ) -> Result<(), String> {
-    send_request(&app, &state, scope.inner(), prompt).await
+    send_request(&app, &state, scope.inner(), prompt, false).await
+}
+
+/// Ask for a proposal only: one strict call, no chat. The UI button behind it
+/// keeps the whole gate — the proposal still has to be approved to run.
+#[tauri::command]
+pub async fn agent_propose(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    scope: State<'_, SharedScope>,
+    prompt: String,
+) -> Result<(), String> {
+    send_request(&app, &state, scope.inner(), prompt, true).await
 }
 
 /// Forget the conversation (the UI clears its transcript alongside this).
@@ -670,6 +698,7 @@ pub async fn agent_send(
 pub async fn agent_reset(state: State<'_, AgentState>) -> Result<(), String> {
     state.session.clear().await;
     state.session.finish();
+    state.session.propose_only.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -896,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn the_request_carries_the_protocol_version_and_history() {
+    fn the_request_carries_the_protocol_version_history_and_flags() {
         let history = vec![ChatTurn {
             role: "user".into(),
             text: "prima".into(),
@@ -905,12 +934,20 @@ mod tests {
             "seconda",
             vec!["Scope include: example.com".into()],
             &history,
+            false,
         );
         assert_eq!(request["v"], PROTOCOL_VERSION);
         assert_eq!(request["v"], 2);
         assert_eq!(request["prompt"], "seconda");
         assert_eq!(request["history"][0]["role"], "user");
         assert_eq!(request["history"][0]["text"], "prima");
+        assert_eq!(request["propose"], true);
+        assert_eq!(request["propose_only"], false);
+
+        // A proposal-only request flips the flags.
+        let request = build_request("", vec![], &[], true);
+        assert_eq!(request["propose"], false);
+        assert_eq!(request["propose_only"], true);
     }
 
     /// The reader task is what turns a reply into a remembered turn; exercise it
