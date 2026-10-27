@@ -932,8 +932,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "elliot-httpraw",
+ "elliot-intruder",
  "elliot-proxy",
+ "elliot-repeater",
  "elliot-scope",
+ "elliot-socks",
  "elliot-store",
  "serde",
  "serde_json",
@@ -941,6 +944,7 @@ dependencies = [
  "tauri-build",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -961,6 +965,7 @@ dependencies = [
  "bytes",
  "http",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -1036,6 +1041,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "elliot-socks"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "elliot-httpraw",
+ "elliot-scope",
+ "elliot-tls",
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "elliot-store"
 version = "0.0.0"
 dependencies = [
@@ -1054,6 +1077,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",

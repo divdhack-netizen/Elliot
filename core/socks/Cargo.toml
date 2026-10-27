@@ -1,0 +1,29 @@
+[package]
+name = "elliot-socks"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+elliot-httpraw = { path = "../httpraw" }
+# The shared CA + minting: the SOCKS path terminates TLS with the same
+# certificate the HTTP proxy uses, so the user installs one.
+elliot-tls = { path = "../tls" }
+
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt"] }
+tokio-rustls = "0.26"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+# A real policy engine, so the scope gate is exercised with the real rules.
+elliot-scope = { path = "../scope" }
+# A self-signed TLS origin for the MITM-path tests.
+rcgen = { version = "0.14.7", features = ["x509-parser"] }
+rustls = "0.23"
+tempfile = "3"
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
