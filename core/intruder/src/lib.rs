@@ -34,8 +34,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
-use elliot_httpraw::{ScopeDecider, ScopeDecision};
-use elliot_repeater::{RepeatRequest, DEFAULT_READ_TIMEOUT};
+use elliot_httpraw::{ScopeDecider, ScopeDecision, Transport};
+use elliot_repeater::{ReadMode, RepeatRequest, DEFAULT_READ_TIMEOUT};
 
 /// One injection payload: raw bytes, so malformed and non-UTF-8 probes work.
 pub type Payload = Vec<u8>;
@@ -49,6 +49,10 @@ pub enum AttackMode {
 }
 
 /// A configured attack.
+///
+/// The target and the base are protocol-agnostic: the base is whatever bytes
+/// came off a captured [`elliot_httpraw::Message`] (or were typed), and the
+/// transport/read mode are those of the [`elliot_repeater`] that carries it.
 #[derive(Clone, Debug)]
 pub struct Attack {
     pub host: String,
@@ -68,6 +72,10 @@ pub struct Attack {
     /// Per-request response timeout.
     pub read_timeout: Duration,
     pub accept_invalid_certs: bool,
+    /// TCP (stream) or UDP (datagram). Defaults to TCP.
+    pub transport: Transport,
+    /// How each response is framed. Defaults to [`ReadMode::Http`].
+    pub read_mode: ReadMode,
 }
 
 impl Attack {
@@ -83,7 +91,21 @@ impl Attack {
             concurrency: 8,
             read_timeout: DEFAULT_READ_TIMEOUT,
             accept_invalid_certs: false,
+            transport: Transport::Tcp,
+            read_mode: ReadMode::Http,
         }
+    }
+
+    /// Replay over UDP (one datagram per request).
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// How each response ends — see [`ReadMode`].
+    pub fn with_read_mode(mut self, read_mode: ReadMode) -> Self {
+        self.read_mode = read_mode;
+        self
     }
 
     /// Payload sets for Sniper/Battering ram: a single set, from strings.
@@ -165,9 +187,35 @@ pub async fn run(
     attack: &Attack,
     scope: &dyn ScopeDecider,
 ) -> Result<(Vec<AttackResult>, AttackSummary), IntruderError> {
+    let mut results = Vec::new();
+    let summary = run_streaming(attack, scope, &mut |r| results.push(r.clone())).await?;
+    results.sort_by_key(|r| r.index);
+    Ok((results, summary))
+}
+
+/// Run the attack and hand each result to `on_result` **as it completes**
+/// (completion order, not generation order), returning the aggregate metrics.
+///
+/// This is what the app uses: an attack over a slow target can run for minutes,
+/// and a result table that fills in as replies arrive is far more useful than
+/// one that appears all at once. [`run`] is the collecting wrapper.
+pub async fn run_streaming(
+    attack: &Attack,
+    scope: &dyn ScopeDecider,
+    // `Send` so the future stays `Send`: the app runs this on a runtime that
+    // requires it for the command to be spawnable.
+    on_result: &mut (dyn FnMut(&AttackResult) + Send),
+) -> Result<AttackSummary, IntruderError> {
     let jobs = plan(attack)?;
 
-    let scheme = if attack.tls { "https" } else { "http" };
+    // The scope token follows the transport: a UDP attack is not an HTTP one,
+    // and the policy must be able to tell them apart (rules that do not name a
+    // transport still match, since `SchemeMatch::Any` is the default).
+    let scheme = match (attack.transport, attack.tls) {
+        (Transport::Udp, _) => "udp",
+        (Transport::Tcp, true) => "https",
+        (Transport::Tcp, false) => "http",
+    };
     let decision = scope.decide(scheme, &attack.host, attack.port, "");
     if decision != ScopeDecision::InScope {
         return Err(IntruderError::OutOfScope {
@@ -189,16 +237,20 @@ pub async fn run(
             raw,
             read_timeout: attack.read_timeout,
             accept_invalid_certs: attack.accept_invalid_certs,
+            transport: attack.transport,
+            read_mode: attack.read_mode,
         };
         (index, assignments, req)
     });
 
-    let mut results: Vec<AttackResult> = stream::iter(requests)
+    let mut in_flight = stream::iter(requests)
         .map(|(index, assignments, req)| async move {
             match elliot_repeater::send(req).await {
                 Ok(resp) => AttackResult {
                     index,
                     assignments,
+                    // Parsed status is `None` for non-HTTP replies; the byte
+                    // count is what the table shows for those.
                     status: resp.response.as_ref().map(|r| r.status),
                     response_len: resp.raw.len(),
                     elapsed: resp.elapsed,
@@ -214,17 +266,19 @@ pub async fn run(
                 },
             }
         })
-        .buffer_unordered(attack.concurrency.max(1))
-        .collect()
-        .await;
-    results.sort_by_key(|r| r.index);
+        .buffer_unordered(attack.concurrency.max(1));
 
-    let summary = AttackSummary {
-        total: results.len(),
-        responses: results.iter().filter(|r| r.error.is_none()).count(),
-        errors: results.iter().filter(|r| r.error.is_some()).count(),
-    };
-    Ok((results, summary))
+    let mut summary = AttackSummary::default();
+    while let Some(result) = in_flight.next().await {
+        summary.total += 1;
+        if result.error.is_none() {
+            summary.responses += 1;
+        } else {
+            summary.errors += 1;
+        }
+        on_result(&result);
+    }
+    Ok(summary)
 }
 
 // --- validation + expansion -------------------------------------------------
@@ -458,6 +512,97 @@ mod tests {
         assert!(matches!(err, IntruderError::OutOfScope { .. }));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(seen.lock().await.len(), 0, "nothing should be sent out of scope");
+    }
+
+    /// A byte range, built through a call so `vec![point(a, b)]` is not read as
+    /// a single-range vector initialisation (clippy's `single_range_in_vec_init`).
+    fn point(start: usize, end: usize) -> Range<usize> {
+        start..end
+    }
+
+    /// A line-protocol server: reads one request, answers `+OK <request>` and
+    /// then **stays open**, so only the read mode can end the reply.
+    async fn line_server() -> (std::net::SocketAddr, Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    buf.truncate(n);
+                    seen.lock().await.push(buf.clone());
+                    let mut reply = b"+OK ".to_vec();
+                    reply.extend_from_slice(&buf);
+                    let _ = sock.write_all(&reply).await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn battering_ram_runs_against_a_non_http_protocol() {
+        let (addr, seen) = line_server().await;
+        let base = Bytes::from_static(b"GET key\r\n");
+        let attack = Attack {
+            positions: vec![point(4, 7)], // "key"
+            payloads: Attack::payloads_from_str(&["a", "bb"]),
+            mode: AttackMode::BatteringRam,
+            read_mode: ReadMode::UntilIdle(Duration::from_millis(80)),
+            read_timeout: Duration::from_secs(2),
+            ..Attack::new(addr.ip().to_string(), addr.port(), base)
+        };
+        let (results, summary) = run(&attack, &ScopePolicy::host_suffix(&addr.ip().to_string()))
+            .await
+            .unwrap();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.responses, 2);
+        assert_eq!(summary.errors, 0);
+        // Non-HTTP replies have no parsed status, but the bytes were read.
+        assert!(results.iter().all(|r| r.status.is_none()));
+        assert!(results.iter().all(|r| r.response_len > 0));
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let got = seen.lock().await;
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|r| r == b"GET a\r\n"));
+        assert!(got.iter().any(|r| r == b"GET bb\r\n"));
+    }
+
+    #[tokio::test]
+    async fn run_streaming_hands_every_result_to_the_callback() {
+        let (addr, _seen) = line_server().await;
+        let attack = Attack {
+            positions: vec![point(4, 7)],
+            payloads: Attack::payloads_from_str(&["a", "b", "c"]),
+            mode: AttackMode::Sniper,
+            read_mode: ReadMode::UntilIdle(Duration::from_millis(60)),
+            read_timeout: Duration::from_secs(2),
+            ..Attack::new(addr.ip().to_string(), addr.port(), Bytes::from_static(b"GET key\r\n"))
+        };
+
+        let mut streamed: Vec<AttackResult> = Vec::new();
+        let summary = run_streaming(&attack, &ScopePolicy::host_suffix(&addr.ip().to_string()), &mut |r| {
+            streamed.push(r.clone())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.total, 3);
+        assert_eq!(streamed.len(), 3, "every result is reported exactly once");
+        let mut indices: Vec<usize> = streamed.iter().map(|r| r.index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1, 2]);
     }
 
     /// Payloads are bytes: a value that is not valid UTF-8 must reach the wire
