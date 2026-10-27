@@ -1,7 +1,7 @@
 # app — the Tauri desktop application
 
-One window, with tabs: **Proxy / Repeater / Intruder / Agent**. Tabs are
-logically separate and share no state between themselves — all shared state
+One window, with tabs: **Proxy / Capture / Repeater / Intruder / Agent**. Tabs
+are logically separate and share no state between themselves — all shared state
 lives in `../core`, so detaching a tab into its own window later is a
 frontend-only change.
 
@@ -9,20 +9,25 @@ frontend-only change.
 
 - Tauri shell and window management.
 - IPC commands exposed to the React frontend.
-- **Agent bridge:** spawns and manages the Python sidecar (`../../agent`) as a
-  Tauri sidecar process, relays chat messages and the "send to agent" context
-  payloads.
+- **Agent bridge** (`agent.rs`): spawns and manages the Python sidecar
+  (`../../agent`) as a Tauri sidecar process, relays the NDJSON frames, and
+  validates each proposal with `elliot-catalog` + `elliot-runner` against the
+  live scope and the open project before the UI is allowed to approve it.
+  `agent_execute` re-validates and runs it; the round trip through the UI is
+  never trusted.
 - Depends on the `core/*` crates for all engine work.
 
 ## `src/` — React + TypeScript frontend
 
-- **Proxy:** virtualized traffic list, raw request/response viewer, filter bar, intercept controls.
+- **Proxy:** virtualized traffic list, raw request/response viewer, filter bar,
+  intercept controls (HTTP requests and paused WebSocket frames, with
+  forward/edit/drop).
 - **Repeater:** raw request editor (byte-level) + send + response viewer; multiple tabs.
 - **Intruder:** base request + injection-point marking, payload config, attack mode, results table.
 - **Agent:** chat window; streaming replies; proposed tool calls rendered as
-  review/approve blocks — only after approval does a proposal reach the runner.
-- **Shared:** scope configuration UI, and the "send to Repeater/Intruder/Agent"
-  actions that operate on the shared raw-request object.
-
-Build tooling (Vite, Cargo workspace wiring, Tauri config) is not initialized
-yet — that is the next scaffolding step.
+  review blocks with the exact argv, effective intrusiveness and required
+  privileges. Confirmation gets more explicit with the risk level (`intrusive`
+  needs a tick, `dangerous` needs a manual unlock); nothing runs before the
+  click, and the backend re-validates anyway.
+- **Shared:** scope configuration UI, and the "send to Repeater/Intruder" actions
+  that operate on the shared raw-request object.

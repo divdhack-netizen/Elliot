@@ -1,3 +1,4 @@
+mod agent;
 mod proxy;
 mod replay;
 mod scope;
@@ -11,6 +12,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(proxy::ProxyState::default())
         .manage(socks::SocksState::default())
+        .manage(agent::AgentState::default())
         .setup(|app| {
             // The project file lives in the app data directory, next to the CA.
             // If that cannot be resolved we fall back to the working directory
@@ -31,6 +33,7 @@ pub fn run() {
             proxy::proxy_stop,
             proxy::proxy_set_intercept,
             proxy::proxy_intercept_decide,
+            proxy::proxy_ws_decide,
             proxy::proxy_get_ca_pem,
             scope::project_status,
             scope::project_create,
@@ -46,6 +49,9 @@ pub fn run() {
             replay::intruder_run,
             replay::send_to_repeater,
             replay::send_to_intruder,
+            agent::agent_send,
+            agent::agent_stop,
+            agent::agent_execute,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

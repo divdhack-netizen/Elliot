@@ -51,10 +51,33 @@ Vedi [../core/README.md](../core/README.md), [../app/README.md](../app/README.md
   rustls + verifier permissivo dietro opt-in + CA locale con minting dei leaf
   per-host, condivisa da proxy e socks).
 - **app (Tauri):** `src-tauri` (guscio, IPC, agent bridge) + `src` (React, 5
-  schermate). Tab Proxy/Capture/Repeater/Intruder/Agente; staccabili in futuro,
-  gratis perché lo stato sta nel core. Capture/Repeater/Intruder restano montati
-  anche quando si cambia tab, così un payload in editing non si perde.
+  schermate). Tab Proxy/Capture/Repeater/Intruder/Agent, tutti attivi; staccabili
+  in futuro, gratis perché lo stato sta nel core. Capture/Repeater/Intruder/Agent
+  restano montati anche quando si cambia tab, così un payload o una chat in corso
+  non si perdono.
 - **agent (Python):** loop di chat, client Ollama, costruzione della proposta.
+
+## Segreti e chiave della CA
+
+La chiave privata della CA è la capacità di intercettare TLS: non è mai a riposo
+in chiaro. `elliot-tls` espone un confine unico, `KeyStore`, con due backend:
+
+- **keychain di sistema** (`keyring`: macOS Keychain, Secret Service su Linux,
+  Credential Manager su Windows), voce `service="elliot"`, `account="ca-key"`.
+  Lo sceglie il guscio desktop; il certificato **pubblico** resta un file
+  (`ca.crt`) accanto, perché l'utente lo installa e non è un segreto.
+- **file cifrato** (`ca.key.enc`, XChaCha20-Poly1305 con seed casuale in
+  `ca.seed`, entrambi `0600`): il default della libreria, usato dai test,
+  dagli esempi e da qualunque chiamante senza sessione desktop. Onesto limite:
+  il seed sta sullo stesso disco, quindi difende da copie/backup del file e da
+  esposizioni accidentali, non da chi legge già i file dell'utente.
+
+Non c'è un terzo backend in chiaro. Il vecchio `ca.key` PEM viene **importato**
+nel backend configurato e **rimosso** al primo avvio; se il keychain non è
+disponibile (headless, CI, permesso negato) si degrada al file cifrato con un
+warning, mai al plaintext. Una CA il cui certificato esiste ma la cui chiave è
+sparita è un errore esplicito: rigenerarla invaliderebbe ogni trust-store
+installato.
 
 ## Storage e file di progetto
 
@@ -365,9 +388,56 @@ davvero** un file esistente: prima lo documentava soltanto e SQLite lo avrebbe
     "Send to Repeater/Intruder" ora funziona sia dal capture non-HTTP sia dalla
     storia HTTP (che costruisce l'argomento in locale), e le schermate restano
     montate per non perdere un payload in editing.
-- **Prossimo:** `runner` dietro l'approvazione umana dell'agente, UI per i
-  messaggi WebSocket, e le estensioni rimandate del piano non-HTTP (dissector,
-  DSL di filtro, session-replay).
+- **Fatto (2026-10-27):** chiusura delle lacune del piano
+  [`chiusura-lacune.md`](plans/chiusura-lacune.md) — **A** intercept
+  WebSocket: `WsDecision` + `WsRegistry` in `intercept.rs` (registro dedicato,
+  non un `Registry<T>` generico), pausa in `WsHandler::handle_message` quando
+  l'intercept è attivo (lo **stesso** toggle dell'HTTP), ricostruzione del frame
+  dello stesso kind per `ForwardEdited` (un edit non-UTF-8 su un frame Text viene
+  rifiutato e l'originale passa), `Drop` = `None` sulla rete. I frame di
+  controllo Ping/Pong/Close non si intercettano mai. Fuori scope non si pausa
+  nulla. `EngineHandle::decide_ws`, `ProxyHandle::decide_ws`, `WsDecision`
+  riesportato; comando Tauri `proxy_ws_decide` e coda WS nella UI di Intercept
+  (editor del payload, Forward/edited/Drop, stesso ⌘↵ ma sul frame). Il messaggio
+  in pausa viaggia come `WsMessage { paused: true }` (D2), non come variante di
+  evento nuova.
+- **Fatto (2026-10-27):** **B** chiave CA a riposo (dettagli in “Segreti e
+  chiave della CA”): `KeyStore::{Keychain, EncryptedFile}` con `ca.key.enc`
+  XChaCha20-Poly1305, migrazione dal `ca.key` in chiaro, fallback automatico
+  quando il keychain non c'è. Il guscio passa `KeyStore::Keychain` sia al proxy
+  sia al SOCKS (una CA, un key, due listener); test, esempi e default della
+  libreria restano su `EncryptedFile`, così la suite non tocca il keychain di
+  chi sviluppa. Verificato: nessun `ca.key` in chiaro dopo l'avvio, handshake
+  reale ancora verde, ramo di fallback esercitato con un keychain forzato a
+  fallire, `TODO(hardening)` rimosso.
+- **Fatto (2026-10-27):** **C** prima verticale dell'agente end-to-end:
+  chat → proposta → validazione → approvazione umana → esecuzione → output.
+  Sidecar **persistente** (`agent/elliot_agent/__main__.py`, una richiesta per
+  riga finché stdin è aperto) con protocollo versionato (`v: 1`), catalogo reale
+  come grounding (`catalog.py`) e validazione pre-invio della proposta (tool,
+  flag, valori, cardinalità: un tool fuori catalogo non lascia mai il processo).
+  Ponte Rust `app/src-tauri/src/agent.rs`: avvio pigro del sidecar (binario
+  accanto all'eseguibile, altrimenti `python -m elliot_agent`), NDJSON su
+  stdin/stdout, eventi `agent://chunk|done|error|proposal|execution|exit`,
+  proposta validata con `runner::validate` contro catalogo + scope live +
+  `project_dir` del progetto aperto (senza progetto: rifiuto, nessuna
+  esecuzione). `agent_execute` **rivalida** e esegue via argv (timeout dal
+  catalogo), quindi un round-trip UI non è mai una prova. UI `app/src/agent/`:
+  chat in streaming e scheda proposta con argv esatto, intrusività e privilegi;
+  le conferme crescono col rischio (`intrusive` richiede una spunta, `dangerous`
+  è bloccato finché l'utente non sblocca esplicitamente, coerente con
+  `RunnerError::DangerousBlocked`). Test: 13 Python (senza rete, modello finto),
+  ponte provato con un sidecar finto e con il sidecar reale, rifiuto fuori scope
+  verificato.
+- **Fatto (2026-10-27):** packaging del sidecar: `scripts/build-sidecar.sh`
+  (PyInstaller, output `app/src-tauri/binaries/elliot-agent-<target-triple>`) e
+  overlay `app/src-tauri/tauri.sidecar.conf.json` (`bundle.externalBin`), usato
+  da `npm run tauri:build:sidecar`. La config base resta senza `externalBin`, così
+  `cargo build`/`tauri build` continuano a funzionare su una macchina senza il
+  binario generato.
+- **Prossimo:** contesto curato selettivo (C7: flow/cattura scelti, non l'intera
+  sessione), rotazione/revoca della CA, e le estensioni rimandate del piano
+  non-HTTP (dissector, DSL di filtro, session-replay).
 
 ## Non ancora deciso
 

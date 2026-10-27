@@ -1,4 +1,5 @@
 import { useCallback, useState } from "react";
+import { AgentScreen } from "./agent/AgentScreen";
 import { CaptureScreen } from "./capture/CaptureScreen";
 import { ProxyScreen } from "./proxy/ProxyScreen";
 import { IntruderScreen } from "./intruder/IntruderScreen";
@@ -11,7 +12,7 @@ const SCREENS: Array<[Screen, string, boolean]> = [
   ["capture", "Capture", true],
   ["repeater", "Repeater", true],
   ["intruder", "Intruder", true],
-  ["agent", "Agent", false],
+  ["agent", "Agent", true],
 ];
 
 export default function App() {
@@ -63,6 +64,9 @@ export default function App() {
         </div>
         <div className="pane" style={{ display: screen === "intruder" ? "flex" : "none" }}>
           <IntruderScreen seed={intruderSeed} />
+        </div>
+        <div className="pane" style={{ display: screen === "agent" ? "flex" : "none" }}>
+          <AgentScreen />
         </div>
       </main>
     </div>

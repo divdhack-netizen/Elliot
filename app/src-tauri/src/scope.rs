@@ -89,6 +89,21 @@ impl ScopeState {
         self.policy.get()
     }
 
+    /// The directory that contains the open project file: the confinement root
+    /// for tool execution (`path` flags may not escape it).
+    ///
+    /// `None` while no project is open — and then no tool runs at all, because
+    /// there would be nothing to confine paths to.
+    pub async fn project_dir(&self) -> Option<PathBuf> {
+        let guard = self.project.lock().await;
+        let path = guard.as_ref()?.path.clone();
+        match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            Some(dir) => Some(dir.to_path_buf()),
+            // A bare file name: the project lives in the current directory.
+            None => std::env::current_dir().ok(),
+        }
+    }
+
     pub fn default_path(&self) -> &Path {
         &self.default_path
     }

@@ -283,6 +283,52 @@ code, .mono { font-family: var(--mono); }
 .kv td { padding: 3px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); vertical-align: top; word-break: break-all; }
 .kv td:first-child { width: 30%; white-space: nowrap; }
 
+/* ---------- Agent ---------- */
+.agent { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.chat {
+  flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column;
+  gap: 10px; padding: 14px 16px;
+}
+.bubble {
+  max-width: 78%; padding: 8px 11px; border-radius: 8px; white-space: pre-wrap;
+  word-break: break-word; font-size: 12.5px; line-height: 1.5;
+}
+.bubble.user { align-self: flex-end; background: var(--accent-dim); border: 1px solid rgba(255, 122, 26, 0.35); }
+.bubble.agent { align-self: flex-start; background: var(--bg-2); border: 1px solid var(--border); }
+.caret { display: inline-block; width: 7px; height: 13px; margin-left: 3px; vertical-align: text-bottom; background: var(--fg-dim); animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+.composer {
+  display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px;
+  border-top: 1px solid var(--border); background: var(--bg-1);
+}
+.composer textarea {
+  flex: 1; min-height: 54px; max-height: 160px; resize: vertical; padding: 8px 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--fg); font: 12.5px/1.5 var(--sans); outline: none;
+}
+.composer textarea:focus { border-color: var(--accent); }
+.proposal, .execution {
+  align-self: stretch; max-width: 100%; background: var(--bg-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.proposal.refused { border-color: rgba(248, 81, 73, 0.45); }
+.execution.failed { border-color: rgba(248, 81, 73, 0.45); }
+.proposal-head { display: flex; align-items: center; gap: 8px; }
+.proposal-head .mono { font-weight: 600; }
+.status-pill.risk.passive { color: var(--fg-dim); }
+.status-pill.risk.low { color: var(--ok); }
+.status-pill.risk.intrusive { color: var(--warn); }
+.status-pill.risk.dangerous { color: var(--err); }
+.argv, .output {
+  margin: 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all;
+  max-height: 260px; overflow: auto;
+}
+.output.stderr { color: #ffb3ae; }
+.proposal-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-dim); }
+.check strong { color: var(--fg); }
+
 /* ---------- Intercept ---------- */
 .intercept { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .intercept-bar {
@@ -300,6 +346,16 @@ code, .mono { font-family: var(--mono); }
 }
 .queue-item:hover { background: var(--bg-2); }
 .queue-item.active { background: var(--bg-3); border-left-color: var(--accent); }
+/* WebSocket frames held by intercept: a list plus a payload editor, above the
+   HTTP queue so both kinds of held traffic are visible at once. */
+.ws-paused {
+  display: flex; flex-direction: column; flex: none; min-height: 0; max-height: 45%;
+  border-bottom: 1px solid var(--border);
+}
+.ws-list { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 10px; max-height: 34%; overflow-y: auto; }
+.ws-list .queue-item { width: auto; border: 1px solid var(--border); border-radius: 4px; }
+.ws-paused .editor { min-height: 90px; max-height: 40vh; }
+.ws-paused .queue-head { padding: 0; }
 .editor-wrap { flex: 1; min-width: 0; display: flex; }
 .editor {
   flex: 1; resize: none; border: 0; outline: none; padding: 10px 12px;
