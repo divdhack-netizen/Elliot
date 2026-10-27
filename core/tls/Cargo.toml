@@ -15,6 +15,12 @@ thiserror = { workspace = true }
 # `Issuer::from_ca_cert_pem` (and unified with hudsucker's rcgen, so the
 # `Issuer` type is literally the same across the proxy and this crate).
 rcgen = { version = "0.14.7", features = ["x509-parser"] }
+# CA private key at rest: the OS keychain, with an authenticated-encryption file
+# as the fallback when no keychain is available (headless, CI).
+keyring = "4"
+chacha20poly1305 = "0.11"
+getrandom = "0.3"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

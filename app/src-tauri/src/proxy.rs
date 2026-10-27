@@ -2,7 +2,7 @@
 //! pump that forwards [`ProxyEvent`]s to the UI as `proxy://flow` events.
 
 use elliot_httpraw::{Flow, WsMessage};
-use elliot_proxy::{start, InterceptDecision, ProxyConfig, ProxyEvent, ProxyHandle};
+use elliot_proxy::{start, InterceptDecision, ProxyConfig, ProxyEvent, ProxyHandle, WsDecision};
 
 use crate::scope::{ScopeState, SharedScope};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,17 @@ pub struct Decision {
     pub edited: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsDecideArgs {
+    pub message_id: uuid::Uuid,
+    /// "forward" | "forward_edited" | "drop".
+    pub action: String,
+    /// Payload bytes for "forward_edited" (text frames must be UTF-8).
+    #[serde(default)]
+    pub edited: Option<Vec<u8>>,
+}
+
 #[tauri::command]
 pub async fn proxy_start(
     app: AppHandle,
@@ -72,6 +83,9 @@ pub async fn proxy_start(
     let config = ProxyConfig {
         listen_addr,
         ca_dir,
+        // The desktop app is the only caller with a session keychain; the key
+        // still falls back to an encrypted file if none is usable.
+        ca_key_store: elliot_proxy::KeyStore::Keychain,
         verify_upstream: args.verify_upstream,
     };
 
@@ -166,6 +180,26 @@ pub async fn proxy_intercept_decide(
 }
 
 #[tauri::command]
+pub async fn proxy_ws_decide(
+    state: State<'_, ProxyState>,
+    args: WsDecideArgs,
+) -> Result<(), String> {
+    let guard = state.handle.lock().await;
+    let handle = guard.as_ref().ok_or("proxy not running")?;
+    let decided = match args.action.as_str() {
+        "forward" => WsDecision::Forward,
+        "drop" => WsDecision::Drop,
+        "forward_edited" => WsDecision::ForwardEdited(
+            args.edited
+                .ok_or("forward_edited requires `edited` bytes")?,
+        ),
+        other => return Err(format!("unknown action: {other}")),
+    };
+    handle.decide_ws(args.message_id, decided);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn proxy_get_ca_pem(state: State<'_, ProxyState>) -> Result<String, String> {
     match &*state.handle.lock().await {
         Some(handle) => Ok(handle.ca_pem()),
@@ -184,6 +218,16 @@ mod tests {
         let a: StartArgs = serde_json::from_str(r#"{"listenAddr":"127.0.0.1:8080"}"#).unwrap();
         assert_eq!(a.listen_addr, "127.0.0.1:8080");
         assert!(a.verify_upstream, "verify_upstream defaults to true");
+    }
+
+    #[test]
+    fn ws_decide_args_accept_camel_case() {
+        let a: WsDecideArgs = serde_json::from_str(
+            r#"{"messageId":"00000000-0000-0000-0000-000000000000","action":"forward_edited","edited":[104,105]}"#,
+        )
+        .unwrap();
+        assert_eq!(a.action, "forward_edited");
+        assert_eq!(a.edited.as_deref(), Some(&b"hi"[..]));
     }
 
     #[test]

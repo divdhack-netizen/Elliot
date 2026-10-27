@@ -14,6 +14,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = ProxyConfig {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], 18081)),
         ca_dir: dir.clone().into(),
+        // A manual run has no reason to touch the login keychain.
+        ca_key_store: elliot_proxy::KeyStore::EncryptedFile,
         verify_upstream: true,
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);

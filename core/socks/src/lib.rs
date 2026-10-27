@@ -36,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use elliot_httpraw::{Direction, FlowState, ScopeDecider, ScopeDecision, Stream, Transport};
+pub use elliot_tls::KeyStore;
 use elliot_tls::Ca;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -74,9 +75,13 @@ pub struct SocksConfig {
     pub mitm_tls: bool,
     /// Verify upstream certificates on the MITM path. Default `true`.
     pub verify_upstream: bool,
-    /// Directory holding the root CA (`ca.crt` + `ca.key`). Shared with the
+    /// Directory holding the root CA (`ca.crt` + the key store). Shared with the
     /// HTTP proxy: one certificate to install, both listeners.
     pub ca_dir: PathBuf,
+    /// Where the CA private key lives. Must match the HTTP proxy's setting, so
+    /// both listeners load the *same* key ([`KeyStore::Keychain`] for the
+    /// desktop app, [`KeyStore::EncryptedFile`] otherwise).
+    pub ca_key_store: KeyStore,
     /// Require RFC 1929 user/password auth. `None` (the default) accepts
     /// no-auth, which is safe only because the listener is loopback-bound.
     pub credentials: Option<(String, String)>,
@@ -89,6 +94,7 @@ impl Default for SocksConfig {
             mitm_tls: false,
             verify_upstream: true,
             ca_dir: PathBuf::from("."),
+            ca_key_store: KeyStore::default(),
             credentials: None,
         }
     }
@@ -150,7 +156,8 @@ pub async fn start(
 
     let ca = if config.mitm_tls {
         Some(Arc::new(
-            Ca::load_or_create(&config.ca_dir).context("preparing root CA")?,
+            Ca::load_or_create_with(&config.ca_dir, config.ca_key_store)
+                .context("preparing root CA")?,
         ))
     } else {
         None

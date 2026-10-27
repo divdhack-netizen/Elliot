@@ -25,8 +25,9 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio_rustls::TlsConnector;
 
 pub mod ca;
+mod keystore;
 
-pub use ca::{Ca, Leaf};
+pub use ca::{Ca, KeyStore, Leaf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -39,6 +40,8 @@ pub enum TlsError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("certificate authority key store: {0}")]
+    KeyStore(String),
 }
 
 /// A client config that verifies the server against the bundled webpki roots.

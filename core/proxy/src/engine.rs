@@ -37,7 +37,8 @@ pub async fn start(
     scope: Arc<dyn ScopeDecider>,
     events: mpsc::Sender<ProxyEvent>,
 ) -> Result<EngineHandle> {
-    let ca = Ca::load_or_create(&config.ca_dir).context("preparing root CA")?;
+    let ca = Ca::load_or_create_with(&config.ca_dir, config.ca_key_store)
+        .context("preparing root CA")?;
     let ca_pem = ca.cert_pem().to_string();
     let authority = RcgenAuthority::new(
         ca.into_issuer(),

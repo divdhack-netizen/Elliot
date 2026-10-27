@@ -49,6 +49,7 @@ pub async fn start_listener_with(
         // what these tests are about.
         verify_upstream: false,
         ca_dir: ca_dir.to_path_buf(),
+        ca_key_store: elliot_socks::KeyStore::EncryptedFile,
         credentials,
     };
     let (tx, rx) = mpsc::channel(256);

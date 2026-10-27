@@ -26,7 +26,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub use elliot_httpraw::{Flow, ScopeDecision, WsDirection, WsKind, WsMessage};
-pub pub use intercept::{InterceptDecision, WsDecision};
+pub use elliot_tls::KeyStore;
+pub use intercept::{InterceptDecision, WsDecision};
 pub use scope::{AllowAll, DenyAll, ScopeDecider};
 
 /// Configuration for a proxy instance.
@@ -36,6 +37,9 @@ pub struct ProxyConfig {
     pub listen_addr: SocketAddr,
     /// Directory where the root CA (`ca.crt` + the key store) is persisted.
     pub ca_dir: PathBuf,
+    /// Where the CA private key lives: the OS keychain (desktop app), or the
+    /// encrypted file (default; headless and tests).
+    pub ca_key_store: KeyStore,
     /// Verify upstream server certificates. Default `true`.
     pub verify_upstream: bool,
 }
@@ -45,6 +49,7 @@ impl Default for ProxyConfig {
         Self {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             ca_dir: PathBuf::from("."),
+            ca_key_store: KeyStore::default(),
             verify_upstream: true,
         }
     }

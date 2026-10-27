@@ -614,6 +614,7 @@ mod tests {
                 mitm_tls: false,
                 verify_upstream: true,
                 ca_dir: dir.path().join("ca"),
+                ca_key_store: elliot_socks::KeyStore::EncryptedFile,
                 credentials: None,
             },
             Arc::new(elliot_httpraw::AllowAll),

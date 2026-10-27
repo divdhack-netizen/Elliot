@@ -81,6 +81,8 @@ pub async fn socks_start(
         mitm_tls: args.mitm_tls,
         verify_upstream: args.verify_upstream,
         ca_dir,
+        // Same store as the HTTP proxy: one CA, one key, two listeners.
+        ca_key_store: elliot_socks::KeyStore::Keychain,
         credentials: None,
     };
 

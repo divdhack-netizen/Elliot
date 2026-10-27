@@ -9,6 +9,7 @@ fn config(dir: &tempfile::TempDir, port: u16) -> ProxyConfig {
     ProxyConfig {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], port)),
         ca_dir: dir.path().to_path_buf(),
+        ca_key_store: elliot_proxy::KeyStore::EncryptedFile,
         verify_upstream: true,
     }
 }

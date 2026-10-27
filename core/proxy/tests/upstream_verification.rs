@@ -37,6 +37,7 @@ async fn start_proxy(addr: SocketAddr, verify_upstream: bool, ca_dir: &Path) -> 
     let config = ProxyConfig {
         listen_addr: addr,
         ca_dir: ca_dir.to_path_buf(),
+        ca_key_store: elliot_proxy::KeyStore::EncryptedFile,
         verify_upstream,
     };
     let scope: Arc<dyn ScopeDecider> = Arc::new(AllowAll);

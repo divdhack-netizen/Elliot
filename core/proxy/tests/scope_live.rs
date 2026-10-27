@@ -101,6 +101,7 @@ async fn scope_decides_capture_and_edits_apply_immediately() {
         ProxyConfig {
             listen_addr: proxy_addr,
             ca_dir: ca_dir.path().to_path_buf(),
+            ca_key_store: elliot_proxy::KeyStore::EncryptedFile,
             verify_upstream: true,
         },
         policy.decider(),
