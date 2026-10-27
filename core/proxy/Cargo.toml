@@ -34,6 +34,10 @@ tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macr
 tokio-rustls = "0.26"
 rcgen = { version = "0.14.7", features = ["x509-parser"] }
 tempfile = "3"
+# The WebSocket end-to-end test: a real client and a real origin, the same
+# protocol stack hudsucker 0.25 uses.
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
 
 [lints]
 workspace = true
