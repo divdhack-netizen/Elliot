@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen } from "./backend";
-import { toRow } from "./format";
+import { timeMs, toRow } from "./format";
 import type { Flow, FlowEvent, Highlight, Row, WsMessage } from "./types";
 
 export type ProxyStatus = "stopped" | "starting" | "running";
@@ -183,10 +183,29 @@ export function useProxy() {
 
   const clearWs = useCallback(() => setWsQueue([]), []);
 
+  /// Load the frames saved in the open project. Live frames captured since the
+  /// snapshot are kept, and the whole window stays chronological.
+  const loadWs = useCallback(async () => {
+    const persisted = await run(invoke<WsMessage[]>("ws_list", { limit: 500 }));
+    if (!persisted) return;
+    const byId = new Map<string, WsMessage>();
+    for (const m of [...persisted, ...wsRowsRef.current]) byId.set(m.id, m);
+    const merged = [...byId.values()].sort((a, b) => timeMs(a.at) - timeMs(b.at));
+    wsRowsRef.current =
+      merged.length > WS_MEMORY_LIMIT ? merged.slice(merged.length - WS_MEMORY_LIMIT) : merged;
+    setWsVersion((v) => v + 1);
+  }, [run]);
+
+  const clearWsRows = useCallback(() => {
+    wsRowsRef.current = [];
+    setWsVersion((v) => v + 1);
+  }, []);
+
   return {
     status, listenAddr, setListenAddr, intercept, error, setError,
     rows, queue, wsQueue, wsRows, highlights,
     start, stop, setIntercept, decide, decideWs, forwardAll, clearWs,
+    loadWs, clearWsRows,
     getCaPem, clear, remove, setHighlight,
   };
 }

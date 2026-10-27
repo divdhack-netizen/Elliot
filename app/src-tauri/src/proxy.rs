@@ -222,6 +222,21 @@ pub async fn proxy_ws_decide(
     Ok(())
 }
 
+/// Forwarded WebSocket frames stored in the open project, oldest first.
+///
+/// Empty when no project is open: nothing is written without one.
+#[tauri::command]
+pub async fn ws_list(
+    state: State<'_, SharedScope>,
+    limit: Option<usize>,
+) -> Result<Vec<WsMessage>, String> {
+    let limit = limit.unwrap_or(500).min(2_000);
+    match state.with_store(|store| store.list_ws_messages(limit)).await {
+        None => Ok(Vec::new()),
+        Some(res) => res.map_err(|e| e.to_string()),
+    }
+}
+
 #[tauri::command]
 pub async fn proxy_get_ca_pem(state: State<'_, ProxyState>) -> Result<String, String> {
     match &*state.handle.lock().await {

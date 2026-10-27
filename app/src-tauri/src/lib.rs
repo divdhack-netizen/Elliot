@@ -34,6 +34,7 @@ pub fn run() {
             proxy::proxy_set_intercept,
             proxy::proxy_intercept_decide,
             proxy::proxy_ws_decide,
+            proxy::ws_list,
             proxy::proxy_get_ca_pem,
             scope::project_status,
             scope::project_create,

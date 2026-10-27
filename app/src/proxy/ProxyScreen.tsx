@@ -9,11 +9,13 @@ import { InterceptView } from "./InterceptView";
 import { MessageViewer, type Message, type ViewerTab } from "./MessageViewer";
 import { HIGHLIGHTS, type Row } from "./types";
 import { useProxy } from "./useProxy";
+import { WsTable } from "./WsTable";
+import { WsViewer } from "./WsViewer";
 import { ScopePanel } from "../scope/ScopePanel";
 import { useScope } from "../scope/useScope";
 import { DEFAULT_TIMEOUT_MS, type AttackArgs, type RepeatArgs } from "../replay/types";
 
-type SubTab = "intercept" | "history" | "scope";
+type SubTab = "intercept" | "history" | "ws" | "scope";
 
 type Props = {
   /// Hand an HTTP request over to the active tools (the same path a captured
@@ -36,6 +38,8 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) 
   const [sub, setSub] = useState<SubTab>("history");
   const [filter, setFilter] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [wsFilter, setWsFilter] = useState("");
+  const [wsSelectedId, setWsSelectedId] = useState<string | null>(null);
   const [layout, setLayout] = useState<"row" | "column">("row");
   const [reqTab, setReqTab] = useState<ViewerTab>("pretty");
   const [resTab, setResTab] = useState<ViewerTab>("pretty");
@@ -54,6 +58,21 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) 
       }
     });
   }, [api.rows, compiled]);
+
+  const wsVisible = useMemo(() => {
+    const q = wsFilter.trim().toLowerCase();
+    if (!q) return api.wsRows;
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    return api.wsRows.filter((m) => {
+      const text = decoder.decode(new Uint8Array(m.payload)).toLowerCase();
+      return (
+        m.host.toLowerCase().includes(q) ||
+        m.kind.toLowerCase().includes(q) ||
+        text.includes(q)
+      );
+    });
+  }, [api.wsRows, wsFilter]);
+  const wsSelected = api.wsRows.find((m) => m.id === wsSelectedId) ?? null;
 
   const selected = api.rows.find((r) => r.flow.id === selectedId) ?? null;
   const reqMsg: Message | null = selected && {
@@ -165,6 +184,11 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) 
             HTTP history
             {api.rows.length > 0 && <span className="count">{api.rows.length}</span>}
           </button>
+          <button className={sub === "ws" ? "active" : ""} onClick={() => setSub("ws")}>
+            WebSocket
+            {api.wsRows.length > 0 && <span className="count">{api.wsRows.length}</span>}
+            {api.wsQueue.length > 0 && <span className="count warn">{api.wsQueue.length}</span>}
+          </button>
           <button className={sub === "scope" ? "active" : ""} onClick={() => setSub("scope")}>
             Scope
             {/* No include rule captures everything, which a bare count of 0
@@ -231,6 +255,47 @@ export function ProxyScreen({ onSendToRepeater, onSendToIntruder }: Props = {}) 
           <ScopePanel api={scope} />
         ) : sub === "intercept" ? (
           <InterceptView api={api} />
+        ) : sub === "ws" ? (
+          <>
+            <div className="filterbar">
+              <span className="filter-icon">⏷</span>
+              <input
+                className={`filter-input mono ${wsFilter ? "valid" : ""}`}
+                placeholder="Filter frames — host, kind or payload text"
+                value={wsFilter}
+                onChange={(e) => setWsFilter(e.target.value)}
+                onKeyDown={(e) => e.key === "Escape" && setWsFilter("")}
+                spellCheck={false}
+              />
+              {wsFilter && (
+                <button className="icon-btn" onClick={() => setWsFilter("")} title="Clear filter">
+                  ✕
+                </button>
+              )}
+              <span className="spacer" />
+              <button
+                className="btn ghost"
+                onClick={() => void api.loadWs()}
+                title="Load the frames saved in the open project"
+              >
+                ⟳ Reload
+              </button>
+              <button
+                className="btn ghost"
+                disabled={!api.wsRows.length}
+                onClick={() => {
+                  api.clearWsRows();
+                  setWsSelectedId(null);
+                }}
+              >
+                Clear
+              </button>
+            </div>
+            <SplitPane direction="column" initial={0.55}>
+              <WsTable rows={wsVisible} selectedId={wsSelectedId} onSelect={setWsSelectedId} />
+              <WsViewer message={wsSelected} />
+            </SplitPane>
+          </>
         ) : (
           <>
             {/* Wireshark display-filter bar: green when valid, red when not. */}

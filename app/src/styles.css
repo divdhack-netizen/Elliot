@@ -222,6 +222,10 @@ code, .mono { font-family: var(--mono); }
 .edited-mark { position: absolute; left: 3px; top: 8px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
 
 .method { font-weight: 600; }
+/* WebSocket direction badge: one glyph, coloured by which side spoke. */
+.dir { font-family: var(--mono); font-weight: 700; }
+.dir.c2s { color: var(--ok, #6cc06c); }
+.dir.s2c { color: var(--accent); }
 .m-get { color: #7ee787; }
 .m-post { color: #ffa657; }
 .m-put, .m-patch { color: #d2a8ff; }
