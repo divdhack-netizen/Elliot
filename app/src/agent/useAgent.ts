@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../proxy/backend";
-import type { ContextItem, Execution, Item, Proposal } from "./types";
+import type { AgentRun, ContextItem, Execution, Item, Proposal } from "./types";
 
 /// Agent chat state: the transcript, the sidecar lifecycle and the proposal
 /// approval path.
@@ -14,7 +14,18 @@ export function useAgent() {
   const [error, setError] = useState<string | null>(null);
   // The explicit context tray, owned by the Rust side and mirrored here.
   const [context, setContext] = useState<ContextItem[]>([]);
+  // Executions recorded in the open project.
+  const [runs, setRuns] = useState<AgentRun[]>([]);
   // The message a stream of `chunk` events appends to.
+
+  const loadRuns = useCallback(async () => {
+    try {
+      setRuns(await invoke<AgentRun[]>("agent_runs", { limit: 100 }));
+    } catch {
+      // No project open: there is nothing to list.
+      setRuns([]);
+    }
+  }, []);
   const streamingId = useRef<string | null>(null);
   const nextId = useRef(1);
 
@@ -58,6 +69,8 @@ export function useAgent() {
           ...prev,
           { kind: "execution", id: `x${nextId.current++}`, execution },
         ]);
+        // The run was persisted before the event, so it is already listable.
+        void loadRuns();
       }),
       listen<ContextItem[]>("agent://context", (items) => setContext(items)),
       listen("agent://exit", () => {
@@ -69,7 +82,7 @@ export function useAgent() {
     return () => {
       for (const un of unlisteners) void un.then((off) => off());
     };
-  }, []);
+  }, [loadRuns]);
 
   const send = useCallback(async (prompt: string) => {
     const text = prompt.trim();
@@ -167,8 +180,8 @@ export function useAgent() {
   }, []);
 
   return {
-    items, busy, alive, error, context,
-    send, propose, run, stop, clear, removeContext, clearContext,
+    items, busy, alive, error, context, runs,
+    send, propose, run, stop, clear, removeContext, clearContext, loadRuns,
   };
 }
 

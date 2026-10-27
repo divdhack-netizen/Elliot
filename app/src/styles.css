@@ -289,6 +289,13 @@ code, .mono { font-family: var(--mono); }
 
 /* ---------- Agent ---------- */
 .agent { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+/* Recorded executions ("Runs"), collapsible above the transcript. */
+.runs {
+  max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg-1);
+}
+.run { border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; background: var(--bg-2); }
+.run.failed { border-color: rgba(248, 81, 73, 0.45); }
 /* Explicit context tray: one chip per attached flow/message. */
 .context-bar {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;

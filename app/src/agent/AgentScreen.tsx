@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { INTRUSIVENESS_LABEL, type Execution, type Proposal } from "./types";
+import { INTRUSIVENESS_LABEL, type AgentRun, type Execution, type Proposal } from "./types";
 import { useAgent } from "./useAgent";
 
 /// The Agent screen: chat with the local model, and the human gate in front of
@@ -10,6 +10,7 @@ import { useAgent } from "./useAgent";
 export function AgentScreen() {
   const api = useAgent();
   const [draft, setDraft] = useState("");
+  const [showRuns, setShowRuns] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -76,7 +77,20 @@ export function AgentScreen() {
             attach a flow from Proxy or a message from Capture ("Send to Agent")
           </span>
         )}
+        <span className="spacer" />
+        <button
+          className="btn ghost"
+          onClick={() => {
+            const open = !showRuns;
+            setShowRuns(open);
+            if (open) void api.loadRuns();
+          }}
+        >
+          {showRuns ? "▾" : "▸"} Runs ({api.runs.length})
+        </button>
       </div>
+
+      {showRuns && <RunsPanel runs={api.runs} />}
 
       <div className="chat">
         {api.items.length === 0 && (
@@ -245,6 +259,45 @@ function ProposalCard({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/// Executions recorded in the open project, newest first. Unlike the transcript
+/// these survive closing and reopening the project.
+function RunsPanel({ runs }: { runs: AgentRun[] }) {
+  return (
+    <div className="runs">
+      {runs.length === 0 ? (
+        <div className="muted small">No recorded executions in this project.</div>
+      ) : (
+        runs.map((run) => {
+          const failed = run.error !== null || run.status !== 0;
+          return (
+            <div key={run.id} className={`run ${failed ? "failed" : ""}`}>
+              <div className="proposal-head">
+                <span className="mono">{run.toolId}</span>
+                <span className="mono small ellipsis">
+                  {run.program} {run.argv.map((arg) => JSON.stringify(arg)).join(" ")}
+                </span>
+                <span className="spacer" />
+                <span className="muted small">
+                  {run.error ? "error" : `exit ${run.status ?? "?"}`}
+                </span>
+                <span className="muted small">{(run.durationMs / 1000).toFixed(2)}s</span>
+                <span className="muted small">
+                  {new Date(run.startedMs).toLocaleTimeString()}
+                </span>
+              </div>
+              {run.error && (
+                <div className="banner error">
+                  <span>{run.error}</span>
+                </div>
+              )}
+            </div>
+          );
+        })
+      )}
     </div>
   );
 }

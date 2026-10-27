@@ -14,6 +14,24 @@ export type Proposal = {
   error: string | null;
 };
 
+/// One recorded execution, as the "Runs" panel shows it. Survivors of a
+/// project reopen, unlike the transcript.
+export type AgentRun = {
+  id: string;
+  proposalId: string | null;
+  toolId: string;
+  program: string;
+  argv: string[];
+  effectiveIntrusiveness: string;
+  requiredPrivileges: string[];
+  startedMs: number;
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  error: string | null;
+};
+
 /// The result of one approved execution.
 export type Execution = {
   proposalId: string;

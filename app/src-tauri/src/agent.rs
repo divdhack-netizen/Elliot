@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use elliot_catalog::{Intrusiveness, Privilege, ToolEntry};
 use elliot_httpraw::ScopeDecider;
@@ -402,29 +402,102 @@ fn privilege_token(privilege: Privilege) -> &'static str {
     }
 }
 
-impl ExecutionView {
+/// One execution, as both the UI view and the durable run record.
+///
+/// Built from the same result so the transcript and the "Runs" panel can never
+/// disagree about the exit status or the output.
+struct ExecutionOutcome {
+    view: ExecutionView,
+    run: elliot_store::AgentRun,
+}
+
+impl ExecutionOutcome {
     fn from_result(
-        result: Result<elliot_runner::Output, RunnerError>,
-        elapsed: Duration,
         proposal_id: Uuid,
+        proposal: &Proposal,
+        cmd: &ValidatedCommand,
+        result: Result<elliot_runner::Output, RunnerError>,
+        started_at: SystemTime,
+        completed_at: SystemTime,
+        elapsed: Duration,
     ) -> Self {
-        match result {
-            Ok(out) => Self {
-                proposal_id,
-                status: out.status,
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-                duration_ms: elapsed.as_millis() as u64,
-                error: None,
-            },
-            Err(e) => Self {
-                proposal_id,
-                status: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                duration_ms: elapsed.as_millis() as u64,
-                error: Some(e.to_string()),
-            },
+        let (status, stdout, stderr, error) = match result {
+            Ok(out) => (out.status, out.stdout, out.stderr, None),
+            Err(e) => (None, Vec::new(), Vec::new(), Some(e.to_string())),
+        };
+        let duration_ms = elapsed.as_millis() as u64;
+        let run = elliot_store::AgentRun {
+            id: Uuid::new_v4(),
+            proposal_id: Some(proposal_id),
+            tool_id: proposal.tool_id.clone(),
+            program: cmd.program.clone(),
+            argv: cmd.argv.clone(),
+            targets: proposal.targets.clone(),
+            effective_intrusiveness: intrusiveness_token(cmd.effective_intrusiveness).into(),
+            required_privileges: cmd
+                .required_privileges
+                .iter()
+                .map(|p| privilege_token(*p).to_string())
+                .collect(),
+            started_at,
+            completed_at,
+            status,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            duration_ms,
+            error: error.clone(),
+        };
+        let view = ExecutionView {
+            proposal_id,
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            duration_ms,
+            error,
+        };
+        Self { view, run }
+    }
+}
+
+/// One recorded run, as the "Runs" panel consumes it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunView {
+    pub id: Uuid,
+    pub proposal_id: Option<Uuid>,
+    pub tool_id: String,
+    pub program: String,
+    pub argv: Vec<String>,
+    pub effective_intrusiveness: String,
+    pub required_privileges: Vec<String>,
+    pub started_ms: u64,
+    pub status: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+impl From<&elliot_store::AgentRun> for AgentRunView {
+    fn from(run: &elliot_store::AgentRun) -> Self {
+        Self {
+            id: run.id,
+            proposal_id: run.proposal_id,
+            tool_id: run.tool_id.clone(),
+            program: run.program.clone(),
+            argv: run.argv.clone(),
+            effective_intrusiveness: run.effective_intrusiveness.clone(),
+            required_privileges: run.required_privileges.clone(),
+            started_ms: run
+                .started_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            status: run.status,
+            stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
+            duration_ms: run.duration_ms,
+            error: run.error.clone(),
         }
     }
 }
@@ -865,11 +938,50 @@ pub async fn agent_execute(
         .map(|seconds| Duration::from_secs(u64::from(seconds)))
         .unwrap_or(DEFAULT_TIMEOUT);
 
+    let started_at = SystemTime::now();
     let started = Instant::now();
     let result = cmd.execute(Some(timeout)).await;
-    let view = ExecutionView::from_result(result, started.elapsed(), proposal_id);
-    let _ = Emitter::emit(&app, EVENT_EXECUTION, view);
+    let outcome = ExecutionOutcome::from_result(
+        proposal_id,
+        &proposal,
+        &cmd,
+        result,
+        started_at,
+        SystemTime::now(),
+        started.elapsed(),
+    );
+
+    // A persistence failure is a warning, not a failed execution: the tool has
+    // already run, and pretending otherwise would be a lie about the target.
+    match scope
+        .inner()
+        .with_store(|store| store.append_agent_run(&outcome.run))
+        .await
+    {
+        Some(Err(e)) => tracing::warn!("persisting agent run {}: {e}", outcome.run.id),
+        None => tracing::debug!("agent run not persisted: no project open"),
+        Some(Ok(())) => {}
+    }
+
+    let _ = Emitter::emit(&app, EVENT_EXECUTION, outcome.view);
     Ok(())
+}
+
+/// Recorded executions, most recent first. Empty when no project is open.
+#[tauri::command]
+pub async fn agent_runs(
+    state: State<'_, SharedScope>,
+    limit: Option<usize>,
+) -> Result<Vec<AgentRunView>, String> {
+    let limit = limit.unwrap_or(100).min(1_000);
+    match state.with_store(|store| store.list_agent_runs(limit)).await {
+        None => Ok(Vec::new()),
+        Some(res) => Ok(res
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(AgentRunView::from)
+            .collect()),
+    }
 }
 
 #[cfg(test)]
@@ -1099,6 +1211,74 @@ mod tests {
         assert_eq!(history[0].role, "assistant");
         assert_eq!(history[0].text, "ciao mondo");
         assert!(session.begin().is_ok(), "the serial gate must be free again");
+    }
+
+    #[test]
+    fn an_execution_becomes_a_run_and_a_view_from_the_same_result() {
+        let proposal = entry_proposal("127.0.0.1");
+        let cmd = ValidatedCommand {
+            program: "nmap".into(),
+            argv: vec!["-sV".into(), "127.0.0.1".into()],
+            effective_intrusiveness: Intrusiveness::Low,
+            required_privileges: vec![Privilege::RawSocket],
+        };
+        let started_at = std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+
+        let outcome = ExecutionOutcome::from_result(
+            Uuid::nil(),
+            &proposal,
+            &cmd,
+            Ok(elliot_runner::Output {
+                status: Some(0),
+                stdout: b"ok\n".to_vec(),
+                stderr: vec![0xff],
+            }),
+            started_at,
+            started_at + Duration::from_millis(250),
+            Duration::from_millis(250),
+        );
+        assert_eq!(outcome.view.status, Some(0));
+        assert_eq!(outcome.view.stdout, "ok\n");
+        assert_eq!(outcome.view.duration_ms, 250);
+        let run = &outcome.run;
+        assert!(!run.id.is_nil(), "every run gets its own id");
+        assert_eq!(run.proposal_id, Some(Uuid::nil()));
+        assert_eq!(run.tool_id, "nmap");
+        assert_eq!(run.program, "nmap");
+        assert_eq!(run.argv, vec!["-sV", "127.0.0.1"]);
+        assert_eq!(run.targets, vec!["127.0.0.1"]);
+        assert_eq!(run.effective_intrusiveness, "low");
+        assert_eq!(run.required_privileges, vec!["raw_socket"]);
+        assert_eq!(run.started_at, started_at);
+        assert_eq!(run.duration_ms, 250);
+        assert_eq!(run.stderr, vec![0xff]);
+        assert!(run.error.is_none());
+
+        // A run that never started still records the attempt, with the error.
+        let outcome = ExecutionOutcome::from_result(
+            Uuid::nil(),
+            &proposal,
+            &cmd,
+            Err(RunnerError::BinaryNotFound("nmap".into())),
+            started_at,
+            started_at,
+            Duration::from_millis(1),
+        );
+        assert_eq!(outcome.view.status, None);
+        assert!(outcome
+            .view
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("nmap"));
+        assert_eq!(outcome.run.error, outcome.view.error);
+        assert!(outcome.run.stdout.is_empty() && outcome.run.stderr.is_empty());
+
+        // The view keeps the run's identity for the "Runs" panel.
+        let view = AgentRunView::from(&outcome.run);
+        assert_eq!(view.id, outcome.run.id);
+        assert_eq!(view.tool_id, "nmap");
+        assert_eq!(view.duration_ms, 1);
     }
 
     #[tokio::test]
