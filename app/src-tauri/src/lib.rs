@@ -31,6 +31,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             proxy::proxy_start,
             proxy::proxy_stop,
+            proxy::proxy_status,
             proxy::proxy_set_intercept,
             proxy::proxy_intercept_decide,
             proxy::proxy_ws_decide,

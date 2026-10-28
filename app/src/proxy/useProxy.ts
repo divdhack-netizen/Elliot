@@ -5,6 +5,13 @@ import type { Flow, FlowEvent, Highlight, Row, WsMessage } from "./types";
 
 export type ProxyStatus = "stopped" | "starting" | "running";
 
+/// The real backend proxy state, mirrored from `proxy_status`.
+type BackendStatus = {
+  running: boolean;
+  listenAddr: string | null;
+  intercept: boolean;
+};
+
 /// How many forwarded frames the live view keeps in memory. The project file
 /// keeps everything; this is only the window shown until "Reload".
 const WS_MEMORY_LIMIT = 2_000;
@@ -75,6 +82,25 @@ export function useProxy() {
     });
     return () => {
       un.then((f) => f());
+    };
+  }, []);
+
+  // A webview reload re-mounts this hook with `status: "stopped"`, but the
+  // proxy handle lives in the backend and keeps running. Reconcile the UI with
+  // the real backend state on mount, so a reloaded window shows (and can stop)
+  // a proxy that is still capturing instead of a dead "Start" button.
+  useEffect(() => {
+    let live = true;
+    invoke<BackendStatus>("proxy_status")
+      .then((s) => {
+        if (!live || !s.running) return;
+        setStatus("running");
+        setInterceptState(s.intercept);
+        if (s.listenAddr) setListenAddr(s.listenAddr);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
     };
   }, []);
 

@@ -26,6 +26,23 @@ async fn binds_on_loopback_and_stops() {
     handle.stop().await;
 }
 
+/// The intercept switch can be read back, so a reloaded UI can reconcile its
+/// own view with the running proxy instead of guessing.
+#[tokio::test]
+async fn intercept_switch_is_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let handle = start(config(&dir, 0), Arc::new(AllowAll), tx)
+        .await
+        .expect("proxy should start on loopback");
+    assert!(!handle.intercept(), "intercept starts off");
+    handle.set_intercept(true);
+    assert!(handle.intercept(), "reads back on after being turned on");
+    handle.set_intercept(false);
+    assert!(!handle.intercept(), "reads back off again");
+    handle.stop().await;
+}
+
 /// Live MITM check against a real HTTPS host. Needs outbound network and the
 /// `curl` binary, so it is ignored by default:
 /// `cargo test -p elliot-proxy -- --ignored live_https_capture`.

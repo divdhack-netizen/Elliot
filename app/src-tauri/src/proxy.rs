@@ -13,6 +13,9 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub struct ProxyState {
     handle: Mutex<Option<ProxyHandle>>,
+    /// The address the running proxy listens on, so `proxy_status` can report
+    /// it to a UI that reloaded and lost its own copy.
+    listen_addr: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +99,7 @@ pub async fn proxy_start(
         .await
         .map_err(|e| e.to_string())?;
     *guard = Some(handle);
+    *state.listen_addr.lock().await = Some(args.listen_addr);
 
     // Pump events to the UI until the channel closes (proxy stopped). Captured
     // flows are persisted here, so a project holds the HTTP history too.
@@ -166,7 +170,33 @@ pub async fn proxy_stop(state: State<'_, ProxyState>) -> Result<(), String> {
     if let Some(handle) = state.handle.lock().await.take() {
         handle.stop().await;
     }
+    *state.listen_addr.lock().await = None;
     Ok(())
+}
+
+/// The real backend proxy state, so a reloaded UI can reconcile its own view
+/// instead of showing "Start" over a proxy that is still capturing.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyStatus {
+    pub running: bool,
+    /// The listen address while running; `None` when stopped.
+    pub listen_addr: Option<String>,
+    /// Whether intercept is currently holding requests.
+    pub intercept: bool,
+}
+
+#[tauri::command]
+pub async fn proxy_status(state: State<'_, ProxyState>) -> Result<ProxyStatus, String> {
+    let guard = state.handle.lock().await;
+    Ok(match guard.as_ref() {
+        Some(handle) => ProxyStatus {
+            running: true,
+            listen_addr: state.listen_addr.lock().await.clone(),
+            intercept: handle.intercept(),
+        },
+        None => ProxyStatus { running: false, listen_addr: None, intercept: false },
+    })
 }
 
 #[tauri::command]

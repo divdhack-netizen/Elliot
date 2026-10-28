@@ -156,6 +156,12 @@ impl EngineHandle {
         self.intercept_on.store(on, Ordering::Relaxed);
     }
 
+    /// Whether intercept is currently holding requests. Lets a caller that lost
+    /// its own view of the switch (e.g. a reloaded UI) read it back.
+    pub fn intercept(&self) -> bool {
+        self.intercept_on.load(Ordering::Relaxed)
+    }
+
     pub fn decide(&self, flow_id: Uuid, decision: InterceptDecision) {
         self.registry.resolve(flow_id, decision);
     }

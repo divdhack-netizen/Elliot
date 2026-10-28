@@ -84,6 +84,12 @@ impl ProxyHandle {
         self.inner.set_intercept(on);
     }
 
+    /// Whether intercept is currently holding requests. Lets a caller that lost
+    /// its own view of the switch (e.g. a reloaded UI) read it back.
+    pub fn intercept(&self) -> bool {
+        self.inner.intercept()
+    }
+
     /// Supply a decision for a paused flow. No-op if the flow is unknown or
     /// already resumed.
     pub fn decide(&self, flow_id: uuid::Uuid, decision: InterceptDecision) {
