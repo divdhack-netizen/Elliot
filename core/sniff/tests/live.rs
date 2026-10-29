@@ -123,6 +123,33 @@ async fn expect_tcp_flow(
     }
 }
 
+/// Print the picker's view of this machine's adapters. Listing needs no BPF
+/// privilege; on a Mac with Wi-Fi the adapter must come out named and flagged.
+#[test]
+#[ignore = "depends on the host's adapters; run with --ignored --nocapture"]
+fn interfaces_are_named_like_the_os_names_them() {
+    let interfaces = list_interfaces().expect("listing capture interfaces");
+    for iface in &interfaces {
+        eprintln!(
+            "{:<10} {:<28} up={:<5} wireless={:<5} connected={:<5} {:?}",
+            iface.name,
+            iface.friendly_name.as_deref().unwrap_or("-"),
+            iface.up,
+            iface.wireless,
+            iface.connected,
+            iface.addresses,
+        );
+    }
+    // awdl0 (AirDrop) is wireless too, so check from the name side: whatever
+    // the OS calls "Wi-Fi" must be flagged as an 802.11 adapter.
+    if let Some(wifi) = interfaces
+        .iter()
+        .find(|i| i.friendly_name.as_deref() == Some("Wi-Fi"))
+    {
+        assert!(wifi.wireless, "the Wi-Fi port must be wireless: {wifi:?}");
+    }
+}
+
 /// Start on loopback, capture a real TCP connection, stop, then start again
 /// immediately on a new port and capture a second connection. The second start
 /// exercises the same path as pressing Start right after Stop (or after a

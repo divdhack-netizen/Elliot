@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { SplitPane } from "../components/SplitPane";
 import { fmtBytes, fmtClock, timeMs } from "../proxy/format";
-import type { PacketMeta, SniffScope } from "./types";
+import type { PacketMeta, SniffIface, SniffScope } from "./types";
 import { useSniffer } from "./useSniffer";
 
 const NO_PACKETS: PacketMeta[] = [];
@@ -68,8 +68,7 @@ export function SnifferScreen() {
                   .filter(Boolean)
                   .join(" · ")}
               >
-                {iface.name}
-                {iface.loopback ? " (loopback)" : ""}
+                {ifaceLabel(iface)}
               </option>
             ))}
           </select>
@@ -354,6 +353,15 @@ export function SnifferScreen() {
       </footer>
     </div>
   );
+}
+
+/// Picker text in Wireshark's spirit: "Wi-Fi (en0) — 192.168.1.74", with the
+/// IPv4 address when there is one and a marker for idle adapters.
+function ifaceLabel(iface: SniffIface): string {
+  const name = iface.friendlyName ? `${iface.friendlyName} (${iface.name})` : iface.name;
+  const ipv4 = iface.addresses.find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a));
+  const state = !iface.up ? "down" : iface.wireless && !iface.connected ? "not associated" : null;
+  return [name, ipv4, state].filter(Boolean).join(" — ");
 }
 
 /// Inline validity hint for the BPF field: a spinner while the backend

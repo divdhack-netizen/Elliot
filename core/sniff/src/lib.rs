@@ -79,9 +79,19 @@ impl Default for SniffConfig {
 #[serde(rename_all = "camelCase")]
 pub struct IfaceInfo {
     pub name: String,
+    /// Human name of the adapter ("Wi-Fi", "Thunderbolt Bridge"), the way
+    /// Wireshark shows it. libpcap has none on macOS, so it comes from the
+    /// system's hardware-port list; `None` when unknown.
+    pub friendly_name: Option<String>,
     pub description: Option<String>,
     pub addresses: Vec<String>,
     pub loopback: bool,
+    /// An 802.11 adapter, as reported by libpcap.
+    pub wireless: bool,
+    /// The interface is up and running.
+    pub up: bool,
+    /// Associated with a network (Wi-Fi) or with a link (wired).
+    pub connected: bool,
 }
 
 /// A flow is a 5-tuple, not a TCP connection: no state machine is tracked in
@@ -178,19 +188,83 @@ impl SniffHandle {
 /// Returns an error if libpcap cannot enumerate devices.
 pub fn list_interfaces() -> Result<Vec<IfaceInfo>> {
     let devices = pcap::Device::list().context("listing capture interfaces")?;
-    Ok(devices
+    let ports = hardware_port_names();
+    let mut interfaces: Vec<IfaceInfo> = devices
         .into_iter()
-        .map(|device| IfaceInfo {
-            name: device.name,
-            description: device.desc,
-            addresses: device
-                .addresses
-                .iter()
-                .map(|address| address.addr.to_string())
-                .collect(),
-            loopback: device.flags.is_loopback(),
+        .map(|device| {
+            let loopback = device.flags.is_loopback();
+            let friendly_name = ports
+                .get(&device.name)
+                .cloned()
+                .or_else(|| loopback.then(|| "Loopback".to_string()));
+            IfaceInfo {
+                friendly_name,
+                description: device.desc,
+                addresses: device
+                    .addresses
+                    .iter()
+                    .map(|address| address.addr.to_string())
+                    .collect(),
+                loopback,
+                wireless: device.flags.is_wireless(),
+                up: device.flags.is_up() && device.flags.is_running(),
+                connected: matches!(
+                    device.flags.connection_status,
+                    pcap::ConnectionStatus::Connected
+                ),
+                name: device.name,
+            }
         })
-        .collect())
+        .collect();
+    // Like Wireshark's welcome list: what can actually carry traffic first,
+    // idle virtual adapters (awdl, utun, gif…) last. The sort is stable, so
+    // libpcap's own order is kept within each group.
+    interfaces.sort_by_key(interface_rank);
+    Ok(interfaces)
+}
+
+/// 0 = up with an address, 1 = up, 2 = down.
+fn interface_rank(iface: &IfaceInfo) -> u8 {
+    match (iface.up, iface.addresses.is_empty()) {
+        (true, false) => 0,
+        (true, true) => 1,
+        (false, _) => 2,
+    }
+}
+
+/// Device → hardware-port name ("en0" → "Wi-Fi"), from macOS's
+/// `networksetup`. Best effort: any failure just leaves the names out.
+#[cfg(target_os = "macos")]
+fn hardware_port_names() -> HashMap<String, String> {
+    std::process::Command::new("/usr/sbin/networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_hardware_ports(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hardware_port_names() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+/// Parse `networksetup -listallhardwareports`: blocks of
+/// `Hardware Port: <name>` followed by `Device: <iface>`.
+fn parse_hardware_ports(text: &str) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let mut port: Option<&str> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix("Hardware Port:") {
+            port = Some(name.trim());
+        } else if let Some(device) = line.strip_prefix("Device:") {
+            if let Some(name) = port.take() {
+                names.insert(device.trim().to_string(), name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Validate a BPF filter expression without opening a device.
@@ -555,6 +629,42 @@ mod tests {
             join: Some(tokio::spawn(std::future::pending::<()>())),
         };
         assert!(!handle.is_running());
+    }
+
+    #[test]
+    fn hardware_ports_map_devices_to_their_names() {
+        let text = "\nHardware Port: Ethernet Adapter (en3)\nDevice: en3\nEthernet Address: 56:a2:4f:31:28:4b\n\n\
+                    Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 2c:ca:16:39:27:0e\n\n\
+                    VLAN Configurations\n===================\n";
+        let names = parse_hardware_ports(text);
+        assert_eq!(names.get("en0").map(String::as_str), Some("Wi-Fi"));
+        assert_eq!(
+            names.get("en3").map(String::as_str),
+            Some("Ethernet Adapter (en3)")
+        );
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn active_interfaces_sort_before_idle_ones() {
+        let iface = |name: &str, up: bool, addr: bool| IfaceInfo {
+            name: name.into(),
+            friendly_name: None,
+            description: None,
+            addresses: if addr { vec!["192.168.1.74".into()] } else { vec![] },
+            loopback: false,
+            wireless: false,
+            up,
+            connected: up,
+        };
+        let mut list = [
+            iface("awdl0", false, false),
+            iface("utun0", true, false),
+            iface("en0", true, true),
+        ];
+        list.sort_by_key(interface_rank);
+        let names: Vec<_> = list.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["en0", "utun0", "awdl0"]);
     }
 
     #[test]

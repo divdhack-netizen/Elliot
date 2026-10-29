@@ -11,9 +11,16 @@ export type SniffScope = "InScope" | "OutOfScope" | "Passthrough";
 /** An interface libpcap can capture on. */
 export type SniffIface = {
   name: string;
+  /** Adapter name as the OS shows it ("Wi-Fi"), when known. */
+  friendlyName: string | null;
   description: string | null;
   addresses: string[];
   loopback: boolean;
+  wireless: boolean;
+  /** Up and running. */
+  up: boolean;
+  /** Associated (Wi-Fi) or linked (wired). */
+  connected: boolean;
 };
 
 /** A 5-tuple observed on the wire, with cumulative counters. */
