@@ -2,6 +2,7 @@ mod agent;
 mod proxy;
 mod replay;
 mod scope;
+mod sniff;
 mod socks;
 
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(proxy::ProxyState::default())
         .manage(socks::SocksState::default())
+        .manage(sniff::SniffState::default())
         .manage(agent::AgentState::default())
         .setup(|app| {
             // The project file lives in the app data directory, next to the CA.
@@ -48,6 +50,11 @@ pub fn run() {
             socks::socks_stop,
             socks::capture_list,
             socks::capture_messages,
+            sniff::sniff_interfaces,
+            sniff::sniff_validate,
+            sniff::sniff_start,
+            sniff::sniff_stop,
+            sniff::sniff_status,
             replay::repeater_send,
             replay::intruder_run,
             replay::send_to_repeater,

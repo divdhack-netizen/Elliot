@@ -4,14 +4,16 @@ import type { ContextInput } from "./agent/types";
 import { invoke } from "./proxy/backend";
 import { CaptureScreen } from "./capture/CaptureScreen";
 import { ProxyScreen } from "./proxy/ProxyScreen";
+import { SnifferScreen } from "./sniff/SnifferScreen";
 import { IntruderScreen } from "./intruder/IntruderScreen";
 import { RepeaterScreen } from "./repeater/RepeaterScreen";
 import type { AttackArgs, RepeatArgs } from "./replay/types";
 
-type Screen = "proxy" | "capture" | "repeater" | "intruder" | "agent";
+type Screen = "proxy" | "capture" | "sniff" | "repeater" | "intruder" | "agent";
 const SCREENS: Array<[Screen, string, boolean]> = [
   ["proxy", "Proxy", true],
   ["capture", "Capture", true],
+  ["sniff", "Sniffer", true],
   ["repeater", "Repeater", true],
   ["intruder", "Intruder", true],
   ["agent", "Agent", true],
@@ -79,6 +81,9 @@ export default function App() {
             onSendToIntruder={toIntruder}
             onSendToAgent={(item) => void toAgent(item)}
           />
+        </div>
+        <div className="pane" style={{ display: screen === "sniff" ? "flex" : "none" }}>
+          <SnifferScreen />
         </div>
         <div className="pane" style={{ display: screen === "repeater" ? "flex" : "none" }}>
           <RepeaterScreen seed={repeaterSeed} />

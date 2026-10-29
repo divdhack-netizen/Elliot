@@ -74,6 +74,64 @@ bash scripts/dev.sh dev       # oppure: cd app && npm run tauri dev
 La prima build Rust/Tauri è lunga (compila l'albero delle dipendenze): atteso.
 Si apre la finestra dell'app sulla vista Proxy.
 
+## Sniffer passivo e permessi BPF (macOS)
+
+La tab **Sniffer** osserva la scheda di rete con libpcap **senza instradare**
+traffico e **senza decifrare**: mostra metadati (IP, porte, protocollo, SNI,
+query DNS, dimensioni, tempi). Sul traffico TLS il contenuto resta cifrato e
+illeggibile — per il chiaro restano Proxy e Capture. La cattura è live-only: in
+v1 non viene scritto nulla nel progetto.
+
+libpcap apre i device `/dev/bpf*`, che su macOS appartengono a root. Senza
+permessi `sniff_start` fallisce subito e la UI mostra un banner esplicito, senza
+crash e senza toccare proxy/SOCKS:
+
+```
+cannot capture on lo0: libpcap error: (cannot open BPF device) /dev/bpf0:
+Permission denied (on macOS the BPF devices require privileges: install
+ChmodBPF, e.g. with Wireshark, or run Elliot with sudo)
+```
+
+Due modi per concedere l'accesso:
+
+1. **ChmodBPF (consigliato).** L'installer di Wireshark include
+   `Install ChmodBPF.pkg`: crea il gruppo `access_bpf` e un LaunchDaemon che
+   mantiene i permessi anche sui device creati dinamicamente. Se Wireshark è
+   già installato ma l'helper non è attivo:
+
+   ```bash
+   sudo /Library/Application\ Support/Wireshark/ChmodBPF/ChmodBPF
+   ```
+
+   Dopo logout/login l'utente è nel gruppo e non serve `sudo`.
+
+2. **Sessione privilegiata**, per una prova rapida:
+
+   ```bash
+   sudo -E bash scripts/dev.sh dev
+   ```
+
+   `-E` conserva l'ambiente (PATH di cargo/npm). È una deroga temporanea, non la
+   configurazione consigliata per l'uso quotidiano.
+
+Nella toolbar si sceglie l'interfaccia (`lo0` per il traffico locale, `en0` per
+la rete) e, se serve, un filtro **BPF** (es. `tcp port 8080`, `udp port 53`).
+Un filtro non valido viene rifiutato all'avvio, prima di leggere pacchetti.
+
+### Test live dello Sniffer
+
+Il test live è marcato `#[ignore]` perché apre un device BPF reale e genera
+traffico su loopback. Con ChmodBPF attivo:
+
+```bash
+cargo test -p elliot-sniff --test live -- --ignored --nocapture
+```
+
+Copre cattura su `lo0` (DLT_NULL su macOS), stop e ripresa immediata su una
+nuova porta. Senza permessi BPF, o se tutti i device sono occupati, il test si
+salta con un messaggio e non fallisce; la suite normale (`cargo test`) lo
+ignora comunque.
+
 ## Verifica end-to-end
 
 1. Prerequisiti fatti; opzionale `ollama serve` + `ollama pull llama3.2:1b`.
@@ -150,8 +208,10 @@ sistema.
 ## Note
 
 - **CLI Tauri non trovata:** è in `devDependencies`, usa `npm run tauri`.
-- **rustls, non OpenSSL:** `pkg-config`/OpenSSL non sono richiesti; in questo
-  milestone il lato Rust non fa rete.
+- **rustls, non OpenSSL:** il lato rete (proxy, SOCKS, repeater, intruder) usa
+  rustls, quindi non servono `pkg-config` né un'OpenSSL di sistema. Lo store
+  SQLCipher compila una copia statica di OpenSSL (vendored) per cifrare il file
+  di progetto, anch'essa senza dipendenze di sistema.
 - **Python 3.14 + macOS 27** molto recenti: `httpx` è puro Python, basso
   rischio di wheel mancanti. PyInstaller 6.22+ supporta la 3.14 (verificato).
 - **Chiave della CA:** l'app usa il keychain quando c'è; in caso contrario il

@@ -27,6 +27,8 @@ elliot/
 ├── catalog/        # tool catalog — schema + vetted standard entries (built)
 ├── core/           # Rust workspace: the engine (no UI)
 │   ├── proxy/      # MITM proxy (TLS CA, HTTP/1.1 & 2, WebSocket)
+│   ├── socks/      # SOCKS5 listener for non-HTTP traffic (CONNECT + UDP ASSOCIATE)
+│   ├── tls/        # TLS policy, local CA and per-host leaves, key storage
 │   ├── scope/      # scope policy engine — single source of truth
 │   ├── store/      # SQLite/SQLCipher project store (per-project file)
 │   ├── httpraw/    # shared raw-bytes editable request model + serializer
@@ -36,7 +38,7 @@ elliot/
 │   └── catalog/    # catalog loader + schema validation
 ├── app/            # Tauri desktop app
 │   ├── src-tauri/  # Rust: shell, IPC commands, agent bridge (depends on core/*)
-│   └── src/        # React + TypeScript frontend (Proxy/Repeater/Intruder/Agent)
+│   └── src/        # React + TypeScript frontend (Proxy/Capture/Repeater/Intruder/Agent)
 ├── agent/          # Python sidecar: chat loop, Ollama client, proposal builder
 └── docs/           # design record
 ```

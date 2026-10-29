@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "core/proxy", "core/scope", "core/store", "core/httpraw",
   "core/repeater", "core/intruder", "core/runner", "core/catalog",
-  "core/tls", "core/socks",
+  "core/tls", "core/socks", "core/sniff",
   "app/src-tauri",
 ]
 

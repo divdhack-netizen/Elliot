@@ -23,6 +23,8 @@ elliot-scope = { path = "../../core/scope" }
 elliot-store = { path = "../../core/store" }
 # The generic (non-HTTP) capture listener and the active-work crates it feeds.
 elliot-socks = { path = "../../core/socks" }
+# Passive capture (libpcap): observes an interface without routing or decrypting.
+elliot-sniff = { path = "../../core/sniff" }
 elliot-repeater = { path = "../../core/repeater" }
 elliot-intruder = { path = "../../core/intruder" }
 # The agent bridge validates a proposal against the catalog and the runner.
