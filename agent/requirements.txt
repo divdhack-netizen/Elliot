@@ -1,0 +1,3 @@
+httpx>=0.27
+# Lettura del catalogo tool (gli stessi YAML del crate `catalog`).
+PyYAML>=6

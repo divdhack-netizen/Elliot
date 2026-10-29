@@ -1,0 +1,16 @@
+[package]
+name = "elliot-catalog"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# YAML is the authored catalog format (schema + entries).
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

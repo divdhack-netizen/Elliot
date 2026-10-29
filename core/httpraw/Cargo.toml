@@ -1,0 +1,18 @@
+[package]
+name = "elliot-httpraw"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bytes = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+http = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The model types cross the Tauri IPC as JSON; the round-trip is part of the
+# contract, so it is tested here rather than only end-to-end.
+serde_json = { workspace = true }

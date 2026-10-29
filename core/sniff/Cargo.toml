@@ -1,0 +1,25 @@
+[package]
+name = "elliot-sniff"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+# Shared transport/scope model; the sniffer only imports it.
+elliot-httpraw = { path = "../httpraw" }
+
+# libpcap (system on macOS) and the zero-allocation packet parser.
+pcap = "2"
+etherparse = "0.15"
+
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+serde = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+# `time` is for the live test's bounded wait for captured packets.
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "elliot-repeater"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+elliot-httpraw = { path = "../httpraw" }
+# The TLS policy (configs + the opt-in permissive verifier) lives in elliot-tls.
+elliot-tls = { path = "../tls" }
+
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+# Only for the `ServerName` used to dial; the rustls config comes from elliot-tls.
+rustls-pki-types = "1"
+
+httparse = "1"
+bytes = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

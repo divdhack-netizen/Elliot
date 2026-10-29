@@ -1,0 +1,42 @@
+[package]
+name = "elliot-app"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "elliot_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+elliot-proxy = { path = "../../core/proxy" }
+elliot-httpraw = { path = "../../core/httpraw" }
+elliot-scope = { path = "../../core/scope" }
+elliot-store = { path = "../../core/store" }
+# The generic (non-HTTP) capture listener and the active-work crates it feeds.
+elliot-socks = { path = "../../core/socks" }
+# Passive capture (libpcap): observes an interface without routing or decrypting.
+elliot-sniff = { path = "../../core/sniff" }
+elliot-repeater = { path = "../../core/repeater" }
+elliot-intruder = { path = "../../core/intruder" }
+# The agent bridge validates a proposal against the catalog and the runner.
+elliot-catalog = { path = "../../core/catalog" }
+elliot-runner = { path = "../../core/runner" }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# The end-to-end test drives a real client, listener and origin over sockets.
+tokio = { workspace = true, features = ["net", "time", "sync"] }
+
+[lints]
+workspace = true

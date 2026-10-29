@@ -1,0 +1,500 @@
+//! elliot-scope — the scope policy engine.
+//!
+//! Elliot's **single source of truth** for which traffic is in scope (capture +
+//! MITM), out of scope, or explicitly excluded (tunnelled transparently). It is
+//! queried by the proxy today and, later, by the repeater, the intruder and the
+//! tool runner, so that "am I allowed to touch this target?" is answered in one
+//! place.
+//!
+//! # Model
+//!
+//! A [`ScopePolicy`] is two lists of [`Rule`]s: `include` says what is in scope,
+//! `exclude` carves exceptions back out. A request is evaluated as:
+//!
+//! 1. **No include rules → [`ScopeDecision::InScope`].** Elliot captures
+//!    *everything* by default. A fresh install behaves like a plain capture
+//!    proxy: start it and the traffic is there, with no scope to define first.
+//! 2. **Matches an exclude rule → [`ScopeDecision::Passthrough`].** Explicitly
+//!    carved out: tunnel it, never MITM it. This is the one rule that applies
+//!    even with no include rule, so "capture all, except my bank" works.
+//! 3. **Matches an include rule (and no exclude) → [`ScopeDecision::InScope`].**
+//! 4. **Include rules exist but nothing matches → [`ScopeDecision::OutOfScope`].**
+//!    The include list *narrows* capture; it is the only way to leave traffic
+//!    alone, and excluding is the explicitly-not-mine signal.
+//!
+//! `Passthrough` and `OutOfScope` both lead the proxy to tunnel without
+//! capturing; they are kept distinct so the UI can tell "explicitly excluded"
+//! from "simply not in your scope".
+//!
+//! # Matching
+//!
+//! Host matching is by **exact host** or **domain suffix** (`.example.com`
+//! matches `example.com` and any subdomain), case-insensitively. There is
+//! deliberately **no regex**: in the spirit of the catalog's safe-by-
+//! construction stance, the matchers cannot express a catastrophic
+//! (ReDoS-prone) pattern. A glob/regex matcher can be added later behind the
+//! same enum if a real need appears.
+
+use std::sync::RwLock;
+
+use serde::{Deserialize, Serialize};
+
+pub use elliot_httpraw::{ScopeDecider, ScopeDecision};
+
+/// A scope policy: `include` defines what is in scope, `exclude` carves
+/// exceptions back out. Serializable so it can live in the project file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopePolicy {
+    #[serde(default)]
+    pub include: Vec<Rule>,
+    #[serde(default)]
+    pub exclude: Vec<Rule>,
+}
+
+impl ScopePolicy {
+    /// An empty policy. Captures everything: no include rule narrows the scope
+    /// and no exclude rule carves anything out.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A policy that includes a single host and all its subdomains.
+    pub fn host_suffix(domain: &str) -> Self {
+        Self {
+            include: vec![Rule::host_suffix(domain)],
+            exclude: Vec::new(),
+        }
+    }
+
+    /// Add an include rule (builder-style).
+    pub fn including(mut self, rule: Rule) -> Self {
+        self.include.push(rule);
+        self
+    }
+
+    /// Add an exclude rule (builder-style).
+    pub fn excluding(mut self, rule: Rule) -> Self {
+        self.exclude.push(rule);
+        self
+    }
+
+    /// Evaluate a target against the policy. See the crate docs for the rules.
+    pub fn evaluate(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision {
+        if self
+            .exclude
+            .iter()
+            .any(|r| r.matches(scheme, host, port, path))
+        {
+            return ScopeDecision::Passthrough;
+        }
+        // No include rule means "everything is included": the include list only
+        // narrows capture, it never turns it off.
+        if self.include.is_empty()
+            || self
+                .include
+                .iter()
+                .any(|r| r.matches(scheme, host, port, path))
+        {
+            ScopeDecision::InScope
+        } else {
+            ScopeDecision::OutOfScope
+        }
+    }
+}
+
+impl ScopeDecider for ScopePolicy {
+    fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision {
+        self.evaluate(scheme, host, port, path)
+    }
+}
+
+/// A [`ScopePolicy`] that can be edited while consumers still hold it.
+///
+/// [`ScopeDecider::decide`] takes `&self`, so a decider already handed to a
+/// running proxy cannot be mutated in place. This wrapper keeps the policy
+/// behind a lock and re-reads it on **every** decision, so an edit made in the
+/// UI applies to the next request instead of only at the next proxy start.
+///
+/// There is no `unsafe` and no async here: the lock is held only for the length
+/// of one evaluation.
+#[derive(Debug, Default)]
+pub struct SharedPolicy {
+    policy: RwLock<ScopePolicy>,
+}
+
+impl SharedPolicy {
+    pub fn new(policy: ScopePolicy) -> Self {
+        Self {
+            policy: RwLock::new(policy),
+        }
+    }
+
+    /// The current policy. An empty policy captures everything.
+    pub fn get(&self) -> ScopePolicy {
+        self.policy.read().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    /// Replace the policy. Takes effect on the next decision.
+    pub fn set(&self, policy: ScopePolicy) {
+        match self.policy.write() {
+            Ok(mut guard) => *guard = policy,
+            // A poisoned lock means a previous panic while evaluating. Losing the
+            // edit is bad, but a silent half-state would be worse.
+            Err(poisoned) => *poisoned.into_inner() = policy,
+        }
+    }
+
+    /// An `Arc<dyn ScopeDecider>` view to hand to a consumer.
+    pub fn decider(self: &std::sync::Arc<Self>) -> std::sync::Arc<dyn ScopeDecider> {
+        self.clone()
+    }
+}
+
+impl ScopeDecider for SharedPolicy {
+    fn decide(&self, scheme: &str, host: &str, port: u16, path: &str) -> ScopeDecision {
+        match self.policy.read() {
+            Ok(policy) => policy.evaluate(scheme, host, port, path),
+            // A poisoned lock means a previous panic. Fail *safe*: capture nothing
+            // rather than intercept traffic the policy may not have allowed.
+            Err(_) => ScopeDecision::Passthrough,
+        }
+    }
+}
+
+/// One matching rule. Every field is a matcher that defaults to "match
+/// anything", so a rule constrains only the dimensions it names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rule {
+    #[serde(default)]
+    pub scheme: SchemeMatch,
+    #[serde(default)]
+    pub host: HostMatch,
+    #[serde(default)]
+    pub port: PortMatch,
+    #[serde(default)]
+    pub path: PathMatch,
+}
+
+impl Rule {
+    /// A rule matching one exact host, any scheme/port/path.
+    pub fn host(host: &str) -> Self {
+        Self {
+            host: HostMatch::Exact(host.to_string()),
+            ..Self::any()
+        }
+    }
+
+    /// A rule matching a domain and its subdomains, any scheme/port/path.
+    pub fn host_suffix(domain: &str) -> Self {
+        Self {
+            host: HostMatch::Suffix(normalize_suffix(domain)),
+            ..Self::any()
+        }
+    }
+
+    /// A rule that matches everything. Building block for the `host*` helpers.
+    pub fn any() -> Self {
+        Self {
+            scheme: SchemeMatch::Any,
+            host: HostMatch::Any,
+            port: PortMatch::Any,
+            path: PathMatch::Any,
+        }
+    }
+
+    /// Constrain this rule to a port (builder-style).
+    pub fn on_port(mut self, port: u16) -> Self {
+        self.port = PortMatch::Exact(port);
+        self
+    }
+
+    /// Constrain this rule to a path prefix (builder-style).
+    pub fn with_path_prefix(mut self, prefix: &str) -> Self {
+        self.path = PathMatch::Prefix(prefix.to_string());
+        self
+    }
+
+    /// Constrain this rule to a scheme (builder-style).
+    pub fn with_scheme(mut self, scheme: SchemeMatch) -> Self {
+        self.scheme = scheme;
+        self
+    }
+
+    fn matches(&self, scheme: &str, host: &str, port: u16, path: &str) -> bool {
+        self.scheme.matches(scheme)
+            && self.host.matches(host)
+            && self.port.matches(port)
+            && self.path.matches(path)
+    }
+}
+
+/// Scheme matcher.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemeMatch {
+    #[default]
+    Any,
+    Http,
+    Https,
+}
+
+impl SchemeMatch {
+    fn matches(self, scheme: &str) -> bool {
+        match self {
+            SchemeMatch::Any => true,
+            SchemeMatch::Http => scheme.eq_ignore_ascii_case("http"),
+            SchemeMatch::Https => scheme.eq_ignore_ascii_case("https"),
+        }
+    }
+}
+
+/// Host matcher. `Exact` matches one host; `Suffix` matches a domain and its
+/// subdomains. Matching is case-insensitive.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostMatch {
+    #[default]
+    Any,
+    Exact(String),
+    Suffix(String),
+}
+
+impl HostMatch {
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            HostMatch::Any => true,
+            HostMatch::Exact(h) => host.eq_ignore_ascii_case(h),
+            HostMatch::Suffix(s) => {
+                let needle = s.as_bytes();
+                let hay = host.as_bytes();
+                if needle.is_empty() {
+                    return false;
+                }
+                // The apex (host == domain) …
+                if hay.eq_ignore_ascii_case(needle) {
+                    return true;
+                }
+                // … or a subdomain: host ends with ".<domain>".
+                hay.len() > needle.len()
+                    && hay[hay.len() - needle.len()..].eq_ignore_ascii_case(needle)
+                    && hay[hay.len() - needle.len() - 1] == b'.'
+            }
+        }
+    }
+}
+
+/// Port matcher.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortMatch {
+    #[default]
+    Any,
+    Exact(u16),
+}
+
+impl PortMatch {
+    fn matches(self, port: u16) -> bool {
+        match self {
+            PortMatch::Any => true,
+            PortMatch::Exact(p) => p == port,
+        }
+    }
+}
+
+/// Path matcher. `Prefix` matches request paths that start with the string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathMatch {
+    #[default]
+    Any,
+    Prefix(String),
+}
+
+impl PathMatch {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            PathMatch::Any => true,
+            PathMatch::Prefix(p) => path.starts_with(p.as_str()),
+        }
+    }
+}
+
+/// Drop a single leading dot so `.example.com` and `example.com` behave alike.
+fn normalize_suffix(domain: &str) -> String {
+    domain.strip_prefix('.').unwrap_or(domain).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_policy_captures_everything() {
+        let p = ScopePolicy::new();
+        assert_eq!(
+            p.evaluate("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        assert_eq!(
+            p.evaluate("http", "10.0.0.7", 8080, "/a/b"),
+            ScopeDecision::InScope
+        );
+    }
+
+    #[test]
+    fn an_empty_policy_still_honours_excludes() {
+        // "Capture everything except this" has to work without an include rule.
+        let p = ScopePolicy::new().excluding(Rule::host("bank.example"));
+        assert_eq!(
+            p.evaluate("https", "bank.example", 443, "/"),
+            ScopeDecision::Passthrough
+        );
+        assert_eq!(
+            p.evaluate("https", "shop.example", 443, "/"),
+            ScopeDecision::InScope
+        );
+    }
+
+    #[test]
+    fn host_suffix_matches_apex_and_subdomains_but_not_siblings() {
+        let p = ScopePolicy::host_suffix("example.com");
+        assert_eq!(
+            p.evaluate("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        assert_eq!(
+            p.evaluate("https", "api.example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        // Not a subdomain, just a suffix collision.
+        assert_eq!(
+            p.evaluate("https", "notexample.com", 443, "/"),
+            ScopeDecision::OutOfScope
+        );
+        // Different domain entirely.
+        assert_eq!(
+            p.evaluate("https", "evil.com", 443, "/"),
+            ScopeDecision::OutOfScope
+        );
+    }
+
+    #[test]
+    fn leading_dot_suffix_is_normalized() {
+        let p = ScopePolicy::host_suffix(".example.com");
+        assert_eq!(
+            p.evaluate("http", "example.com", 80, "/"),
+            ScopeDecision::InScope
+        );
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive() {
+        let p = ScopePolicy::new().including(Rule::host("Example.COM"));
+        assert_eq!(
+            p.evaluate("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+    }
+
+    #[test]
+    fn exclude_wins_over_include() {
+        let p = ScopePolicy::host_suffix("example.com")
+            .excluding(Rule::host("admin.example.com"));
+        assert_eq!(
+            p.evaluate("https", "api.example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        // Excluded subdomain is explicitly tunnelled.
+        assert_eq!(
+            p.evaluate("https", "admin.example.com", 443, "/"),
+            ScopeDecision::Passthrough
+        );
+    }
+
+    #[test]
+    fn scheme_port_and_path_constraints_apply() {
+        let p = ScopePolicy::new().including(
+            Rule::host_suffix("example.com")
+                .with_scheme(SchemeMatch::Https)
+                .on_port(443)
+                .with_path_prefix("/api/"),
+        );
+        assert_eq!(
+            p.evaluate("https", "example.com", 443, "/api/users"),
+            ScopeDecision::InScope
+        );
+        // Wrong scheme.
+        assert_eq!(
+            p.evaluate("http", "example.com", 443, "/api/users"),
+            ScopeDecision::OutOfScope
+        );
+        // Wrong port.
+        assert_eq!(
+            p.evaluate("https", "example.com", 8443, "/api/users"),
+            ScopeDecision::OutOfScope
+        );
+        // Wrong path.
+        assert_eq!(
+            p.evaluate("https", "example.com", 443, "/public"),
+            ScopeDecision::OutOfScope
+        );
+    }
+
+    #[test]
+    fn works_through_the_trait_object() {
+        let decider: std::sync::Arc<dyn ScopeDecider> =
+            std::sync::Arc::new(ScopePolicy::host_suffix("example.com"));
+        assert_eq!(
+            decider.decide("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+    }
+
+    #[test]
+    fn shared_policy_reflects_edits_immediately() {
+        let shared = std::sync::Arc::new(SharedPolicy::default());
+        let decider = shared.decider();
+
+        // Empty policy: everything is captured.
+        assert_eq!(
+            decider.decide("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+
+        // Same decider handle, edited policy → the next decision changes.
+        shared.set(ScopePolicy::host_suffix("example.com"));
+        assert_eq!(
+            decider.decide("https", "example.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        assert_eq!(
+            decider.decide("https", "evil.com", 443, "/"),
+            ScopeDecision::OutOfScope
+        );
+
+        // And clearing the include list captures everything again.
+        shared.set(ScopePolicy::new());
+        assert_eq!(
+            decider.decide("https", "evil.com", 443, "/"),
+            ScopeDecision::InScope
+        );
+        assert_eq!(shared.get(), ScopePolicy::new());
+    }
+
+    #[test]
+    fn policy_round_trips_through_json() {
+        let p = ScopePolicy::host_suffix("example.com")
+            .excluding(Rule::host("admin.example.com").with_path_prefix("/x"));
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ScopePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn rule_json_uses_snake_case_tags() {
+        let json = serde_json::to_string(&Rule::host_suffix("example.com")).unwrap();
+        // Matcher variants serialize as snake_case, externally tagged.
+        assert!(json.contains("\"suffix\""), "got: {json}");
+        assert!(json.contains("\"any\""), "got: {json}");
+    }
+}

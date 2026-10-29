@@ -1,0 +1,22 @@
+[package]
+name = "elliot-runner"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+elliot-catalog = { path = "../catalog" }
+elliot-httpraw = { path = "../httpraw" }
+
+# Validate string-flag argument values against their catalog `pattern`.
+regex = "1"
+
+tokio = { workspace = true, features = ["process", "io-util", "time", "macros"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+elliot-scope = { path = "../scope" }
+tempfile = "3"
+tokio = { workspace = true, features = ["process", "io-util", "time", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

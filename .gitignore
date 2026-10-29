@@ -1,1 +1,15 @@
 .DS_Store
+
+# Build artifacts
+target/
+node_modules/
+app/dist/
+
+# Python sidecar
+agent/.venv/
+__pycache__/
+# Binario del sidecar prodotto da scripts/build-sidecar.sh
+app/src-tauri/binaries/
+
+# Project files (SQLite)
+*.db

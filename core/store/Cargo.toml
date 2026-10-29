@@ -1,0 +1,28 @@
+[package]
+name = "elliot-store"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+elliot-httpraw = { path = "../httpraw" }
+
+# SQLite + SQLCipher, statically bundled with a vendored OpenSSL so the build is
+# self-contained (no system OpenSSL / pkg-config needed, matching the project's
+# "portable single file" goal). SQLCipher gives us passphrase encryption at
+# rest from day one, as decided in docs/architecture.md.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = { workspace = true }
+# Agent-run vectors (argv, targets, privileges) are stored as compact JSON so a
+# human inspecting the file can read them. The store does not depend on serde
+# itself: `AgentRun` stays a plain struct and the Tauri shell shapes the view.
+serde_json = { workspace = true }
+# Message payloads are bytes, not text.
+bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

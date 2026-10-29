@@ -1,0 +1,14 @@
+[package]
+name = "elliot-scope"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+elliot-httpraw = { path = "../httpraw" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

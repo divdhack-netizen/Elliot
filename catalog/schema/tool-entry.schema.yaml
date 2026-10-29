@@ -1,0 +1,135 @@
+# Elliot tool-catalog entry schema.
+# JSON Schema (draft 2020-12), authored in YAML for readability.
+#
+# Both the Rust Tool runner and the Python agent validate EVERY catalog entry
+# against this file. It is the single enforcement artifact.
+#
+# Safe-by-construction: the only VALID way to write a field is the safe way.
+#   - a `string` flag MUST carry a `pattern` (no unconstrained free text)
+#   - a `path` flag MUST be `confined_to` a location and declare `access`
+#   - an `enum` flag MUST list its allowed `values`
+#   - `base_intrusiveness` is REQUIRED (no entry can omit its risk level)
+#   - `target.scope_checked` is `const: true` (scope checking cannot be disabled)
+#   - `additionalProperties: false` everywhere → there is NO free-form "raw args"
+#     field, and nothing undeclared can be smuggled into an entry.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://elliot.local/catalog/tool-entry.schema.yaml"
+title: Elliot tool catalog entry
+type: object
+additionalProperties: false
+required: [id, binary, source, description, base_intrusiveness, target, flags]
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+    description: Unique tool identifier.
+  binary:
+    type: string
+    minLength: 1
+    description: Executable the Tool runner must verify exists before running.
+  source:
+    enum: [standard, custom]
+    description: standard = bundled & vetted by maintainers; custom = user-authored.
+  description:
+    type: string
+    minLength: 1
+  base_intrusiveness:
+    $ref: "#/$defs/intrusiveness"
+    description: Floor intrusiveness for this tool.
+  limits:
+    type: object
+    additionalProperties: false
+    description: Blast-radius caps enforced by the Tool runner.
+    properties:
+      max_targets: { type: integer, minimum: 1 }
+      timeout_seconds: { type: integer, minimum: 1 }
+      max_rate: { type: integer, minimum: 1 }
+  target:
+    type: object
+    additionalProperties: false
+    required: [kind, type, cardinality, scope_checked]
+    description: How targets are expressed; what the Rust runner hands to the scope engine.
+    properties:
+      kind:
+        enum: [positional, flag]
+      flag:
+        type: string
+        description: Required when kind=flag; the flag that carries the target.
+      type:
+        enum: [host, cidr, host_or_cidr, url, port_range]
+      cardinality:
+        enum: [one, one_or_more]
+      scope_checked:
+        const: true
+        description: Targets ALWAYS pass through the scope engine; cannot be disabled.
+    allOf:
+      - if:
+          properties: { kind: { const: flag } }
+          required: [kind]
+        then:
+          required: [flag]
+  flags:
+    type: array
+    description: The allow-list. Only flags listed here may be proposed or executed.
+    items: { $ref: "#/$defs/flag" }
+
+$defs:
+  intrusiveness:
+    enum: [passive, low, intrusive, dangerous]
+    description: >
+      passive/low -> auto or notify; intrusive -> mandatory human confirmation;
+      dangerous -> the agent can never propose it, manual unlock only.
+  flag:
+    type: object
+    additionalProperties: false
+    required: [name, type, description]
+    properties:
+      name:
+        type: string
+        pattern: "^-{1,2}[A-Za-z0-9][A-Za-z0-9-]*$"
+      type:
+        enum: [bool, int, enum, string, path]
+      description:
+        type: string
+        minLength: 1
+      intrusiveness:
+        $ref: "#/$defs/intrusiveness"
+        description: Optional; raises the command's effective level (max of tool + used flags).
+      repeatable:
+        type: boolean
+        default: false
+      requires_privilege:
+        enum: [raw_socket]
+        description: Optional; declares the flag needs an elevated OS capability.
+      # --- type-specific constraint fields (requiredness enforced in allOf) ---
+      min: { type: integer }
+      max: { type: integer }
+      values:
+        type: array
+        items: { type: string }
+        minItems: 1
+      pattern:
+        type: string
+        description: Required for type=string. Validates the argument value.
+      confined_to:
+        enum: [project_dir]
+        description: Required for type=path. Where the path may point.
+      access:
+        enum: [read, write]
+        description: Required for type=path.
+    allOf:
+      - if:
+          properties: { type: { const: string } }
+          required: [type]
+        then:
+          required: [pattern]
+      - if:
+          properties: { type: { const: path } }
+          required: [type]
+        then:
+          required: [confined_to, access]
+      - if:
+          properties: { type: { const: enum } }
+          required: [type]
+        then:
+          required: [values]
